@@ -1,4 +1,4 @@
 # Automatically configure the Exar XR21B1411 RS-485 USB stick for EPEVER Tracer
 # controllers (gpio_mode=0x0b). Install with scripts/install.sh.
 SUBSYSTEM=="usb", ATTR{idVendor}=="04e2", ATTR{idProduct}=="1411", \
-    RUN+="/home/pi/epever-tracer-mqtt/configure-exar-rs485.py"
+    RUN+="@REPO_DIR@/configure-exar-rs485.py"

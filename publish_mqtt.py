@@ -38,9 +38,18 @@ except ImportError as e:
 # Local module
 try:
     from solar_data import (
+        HISTORY_SAMPLE_INTERVAL,
+        LIGHTS_STATES,
+        compute_battery_level_pct,
+        display_time_remaining,
+        get_lights_state,
         get_solar_data,
+        is_charger_reachable,
+        read_battery_voltage,
         set_lights_enabled,
+        set_lights_state,
     )
+    from telemetry_store import TelemetryStore
 except ImportError:
     print("solar_data.py must be in the same directory.")
     sys.exit(1)
@@ -194,6 +203,45 @@ def publish_binary_discovery(client: mqtt.Client, cfg: Dict[str, Any], key: str,
     print(f"  Discovery: {config_topic}")
 
 
+def publish_select_discovery(
+    client: mqtt.Client,
+    cfg: Dict[str, Any],
+    key: str,
+    name: str,
+    options: list,
+):
+    """Publish Home Assistant MQTT discovery config for a select."""
+    if not cfg["mqtt_ha_discovery_prefix"]:
+        return
+
+    base_topic = cfg["mqtt_base_topic"]
+    discovery_prefix = cfg["mqtt_ha_discovery_prefix"]
+    device_id = cfg["device_id"]
+
+    unique_id = f"{device_id}_{key}"
+    config_topic = f"{discovery_prefix}/select/{device_id}/{key}/config"
+    state_topic = f"{base_topic}/{key}"
+    command_topic = f"{base_topic}/{key}/set"
+
+    config = {
+        "name": name,
+        "state_topic": state_topic,
+        "command_topic": command_topic,
+        "unique_id": unique_id,
+        "options": options,
+        "device": {
+            "identifiers": [device_id],
+            "name": cfg["device_name"],
+            "manufacturer": cfg["manufacturer"],
+            "model": cfg["model"],
+        },
+        **_availability_fields(cfg),
+    }
+
+    client.publish(config_topic, payload=json.dumps(config), qos=1, retain=True)
+    print(f"  Select Discovery: {config_topic}")
+
+
 def publish_switch_discovery(client: mqtt.Client, cfg: Dict[str, Any], key: str, name: str,
                              payload_on="on", payload_off="off"):
     """Publish Home Assistant MQTT discovery config for a switch (toggleable)."""
@@ -246,14 +294,27 @@ DISCOVERY_MAP = {
     "consumed_energy_today": ("Consumed Energy Today", "kWh", "energy", "total_increasing"),
     "generated_energy_today": ("Generated Energy Today", "kWh", "energy", "total_increasing"),
     "charging_status": ("Charging Status", None, None, None),
+    "battery_level_pct": ("Battery Level", "%", "battery", "measurement"),
+    "time_remaining": ("Time Remaining", None, None, None),
+    "time_remaining_seconds": ("Time Remaining Seconds", "s", "duration", "measurement"),
 }
 
 # Binary sensors (read-only states)
 BINARY_DISCOVERY_MAP = {
     "is_charging": ("Charging", None),
+    "is_night": ("PV Night", None),
 }
 
-# Switches (toggleable control)
+BINARY_PAYLOADS = {
+    "is_night": ("true", "false"),
+}
+
+# Selects (multi-state control)
+SELECT_DISCOVERY_MAP = {
+    "lights_mode": ("Lights Mode", list(LIGHTS_STATES)),
+}
+
+# Switches (toggleable control; forces manual on/off, exits auto mode)
 SWITCH_DISCOVERY_MAP = {
     "lights_on": ("Lights Relay", "on", "off"),
 }
@@ -270,20 +331,23 @@ EXTRA_STATE_KEYS = (
     "charging_equipment_status",
     "load_control_mode",
     "lights_manual_mode",
+    "lights_state",
+    "battery_soc",
+    "battery_level_pct",
+    "system_rated_voltage",
 )
+
+CONFIG_REFRESH_SEC = 60.0
+UNREACHABLE_CLEAR_THRESHOLD = 3
 
 ALL_STATE_KEYS = (
     tuple(DISCOVERY_MAP.keys())
     + tuple(BINARY_DISCOVERY_MAP.keys())
+    + tuple(SELECT_DISCOVERY_MAP.keys())
     + tuple(SWITCH_DISCOVERY_MAP.keys())
     + EXTRA_STATE_KEYS
     + ("last_update",)
 )
-
-
-def is_charger_reachable(data: Dict[str, Any]) -> bool:
-    """True when at least one register was read from the controller."""
-    return not all(v is None for v in data.values())
 
 
 def publish_charger_reachability(client: mqtt.Client, cfg: Dict[str, Any], reachable: bool):
@@ -326,7 +390,13 @@ def publish_all_discoveries(client: mqtt.Client, cfg: Dict[str, Any]):
     for key, (name, unit, device_class, state_class) in DISCOVERY_MAP.items():
         publish_discovery(client, cfg, key, name, unit, device_class, state_class)
     for key, (name, device_class) in BINARY_DISCOVERY_MAP.items():
-        publish_binary_discovery(client, cfg, key, name, device_class)
+        payload_on, payload_off = BINARY_PAYLOADS.get(key, ("on", "off"))
+        publish_binary_discovery(
+            client, cfg, key, name, device_class,
+            payload_on=payload_on, payload_off=payload_off,
+        )
+    for key, (name, options) in SELECT_DISCOVERY_MAP.items():
+        publish_select_discovery(client, cfg, key, name, options)
     for key, (name, p_on, p_off) in SWITCH_DISCOVERY_MAP.items():
         publish_switch_discovery(client, cfg, key, name, p_on, p_off)
     publish_binary_discovery(
@@ -341,17 +411,57 @@ def publish_all_discoveries(client: mqtt.Client, cfg: Dict[str, Any]):
     )
 
 
-def publish_states(client: mqtt.Client, cfg: Dict[str, Any]):
+def _config_has_values(config: Dict[str, Any]) -> bool:
+    return any(v is not None for k, v in config.items() if not k.endswith("_name"))
+
+
+def publish_states(
+    client: mqtt.Client,
+    cfg: Dict[str, Any],
+    telemetry: TelemetryStore,
+    cached_config: Dict[str, Any],
+    last_config_read: float,
+    runtime: Dict[str, Any],
+) -> float:
     """Read current data and publish all states + discovery (including switches for control)."""
-    data = get_solar_data(device=cfg["serial_device"])
+    now = time.time()
+    need_config = (
+        not cached_config
+        or (now - last_config_read) >= CONFIG_REFRESH_SEC
+    )
+    data = get_solar_data(device=cfg["serial_device"], include_config=need_config)
+    if need_config and data.get("config") and _config_has_values(data["config"]):
+        cached_config.clear()
+        cached_config.update(data["config"])
+        last_config_read = now
+    if cached_config:
+        data["config"] = dict(cached_config)
+    data["battery_level_pct"] = compute_battery_level_pct(data, data.get("config"))
+    telemetry.record_charger_sample(data)
+
+    time_label, time_seconds = display_time_remaining(
+        data, telemetry.voltage_history, telemetry.rate_log,
+    )
+    data["time_remaining"] = time_label
+    data["time_remaining_seconds"] = time_seconds
 
     if not is_charger_reachable(data):
-        print("WARNING: Charger unreachable - clearing MQTT states")
-        publish_charger_reachability(client, cfg, False)
-        clear_all_states(client, cfg)
-        return
+        runtime["consecutive_failures"] = runtime.get("consecutive_failures", 0) + 1
+        failures = runtime["consecutive_failures"]
+        print(
+            f"WARNING: Charger unreachable ({failures}/{UNREACHABLE_CLEAR_THRESHOLD}) "
+            "- keeping last MQTT states"
+        )
+        if failures >= UNREACHABLE_CLEAR_THRESHOLD:
+            publish_charger_reachability(client, cfg, False)
+            clear_all_states(client, cfg)
+            runtime["was_reachable"] = False
+        return last_config_read
 
-    publish_charger_reachability(client, cfg, True)
+    runtime["consecutive_failures"] = 0
+    if not runtime.get("was_reachable", True):
+        publish_charger_reachability(client, cfg, True)
+    runtime["was_reachable"] = True
 
     def _to_onoff(v):
         if v is None:
@@ -364,20 +474,33 @@ def publish_states(client: mqtt.Client, cfg: Dict[str, Any]):
             return "on"
         return str(v).lower()
 
+    data["lights_mode"] = get_lights_state(data)
+
     for key in ("is_charging", "lights_on"):
         if key in data:
             data[key] = _to_onoff(data[key])
+
+    if data.get("is_night") is not None:
+        data["is_night"] = "true" if data["is_night"] else "false"
 
     base_topic = cfg["mqtt_base_topic"]
 
     # Publish states (retained)
     for key, value in data.items():
+        if key == "config":
+            continue
         publish_value(client, f"{base_topic}/{key}", value, retain=True)
 
     last_update = time.strftime("%Y-%m-%d %H:%M:%S")
     publish_value(client, f"{base_topic}/last_update", last_update, retain=True)
 
+    try:
+        telemetry.persist()
+    except OSError as exc:
+        print(f"Failed to persist telemetry: {exc}")
+
     publish_all_discoveries(client, cfg)
+    return last_config_read
 
 
 def main():
@@ -398,19 +521,36 @@ def main():
 
     client = connect_mqtt(cfg)
     base_topic = cfg["mqtt_base_topic"]
+    telemetry = TelemetryStore.load()
+    cached_config: Dict[str, Any] = {}
+    last_config_read = 0.0
+    last_sample = 0.0
+    last_publish = 0.0
+    runtime: Dict[str, Any] = {
+        "consecutive_failures": 0,
+        "was_reachable": True,
+    }
 
-    # Subscribe to command topics so HA switches can control us
+    # Subscribe to command topics so HA can control lights
     client.subscribe(f"{base_topic}/lights_on/set")
+    client.subscribe(f"{base_topic}/lights_mode/set")
 
     def on_message(client, userdata, msg):
         payload = msg.payload.decode().strip().lower()
         topic = msg.topic
         print(f"Received command: {topic} = {payload}")
         try:
-            if topic.endswith("lights_on/set"):
-                set_lights_enabled(payload == "on")
+            if topic.endswith("lights_mode/set"):
+                if payload in LIGHTS_STATES:
+                    set_lights_state(payload, device=cfg["serial_device"], quiet=True)
+                else:
+                    print(f"  Ignored unknown lights mode: {payload!r}")
+            elif topic.endswith("lights_on/set"):
+                set_lights_enabled(payload == "on", device=cfg["serial_device"], quiet=True)
             time.sleep(0.7)  # let the controller apply the change
-            publish_states(client, cfg)  # push updated state immediately
+            last_config_read = publish_states(
+                client, cfg, telemetry, cached_config, last_config_read, runtime,
+            )
         except Exception as e:
             print(f"Command handler error: {e}")
 
@@ -424,14 +564,38 @@ def main():
     # Register HA entities (availability + reachability sensor) before first read.
     publish_all_discoveries(client, cfg)
 
-    # Initial publish (states + switch discovery)
-    publish_states(client, cfg)
+    def sample_voltage_history() -> None:
+        nonlocal last_sample
+        voltage = read_battery_voltage(device=cfg["serial_device"])
+        if voltage is not None:
+            telemetry.add_voltage_sample(voltage)
+            try:
+                telemetry.persist()
+            except OSError as exc:
+                print(f"Failed to persist telemetry: {exc}")
+        last_sample = time.time()
 
-    # Periodic publish loop
+    # Initial publish (states + switch discovery)
+    sample_voltage_history()
+    last_config_read = publish_states(
+        client, cfg, telemetry, cached_config, last_config_read, runtime,
+    )
+    last_publish = time.time()
+
+    # Sample voltage every 5s for trend/time-remaining; full publish on interval.
     try:
         while True:
-            time.sleep(cfg["publish_interval"])
-            publish_states(client, cfg)
+            now = time.time()
+            if now - last_sample >= HISTORY_SAMPLE_INTERVAL:
+                sample_voltage_history()
+
+            if now - last_publish >= cfg["publish_interval"]:
+                last_config_read = publish_states(
+                    client, cfg, telemetry, cached_config, last_config_read, runtime,
+                )
+                last_publish = now
+
+            time.sleep(1)
     except KeyboardInterrupt:
         print("\nShutting down...")
     finally:

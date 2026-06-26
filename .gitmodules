@@ -1,0 +1,3 @@
+[submodule "vendor/epsolar-tracer"]
+	path = vendor/epsolar-tracer
+	url = https://github.com/kasbert/epsolar-tracer.git

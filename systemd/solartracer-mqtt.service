@@ -1,0 +1,19 @@
+[Unit]
+Description=SolarTracer MQTT Publisher
+After=network-online.target mosquitto.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/epever-tracer-mqtt
+ExecStart=/usr/bin/python3 /home/pi/epever-tracer-mqtt/publish_mqtt.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SupplementaryGroups=dialout
+
+[Install]
+WantedBy=multi-user.target

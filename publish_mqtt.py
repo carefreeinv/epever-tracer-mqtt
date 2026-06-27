@@ -38,9 +38,10 @@ except ImportError as e:
 # Local module
 try:
     from solar_data import (
-        HISTORY_SAMPLE_INTERVAL,
+        CONFIG_MQTT_KEYS,
         LIGHTS_STATES,
         compute_battery_level_pct,
+        config_has_values,
         display_time_remaining,
         get_lights_state,
         get_solar_data,
@@ -49,6 +50,7 @@ try:
         set_lights_enabled,
         set_lights_state,
     )
+    from serial_device import device_realpath, rescan_serial_device, resolve_serial_device
     from telemetry_store import TelemetryStore
 except ImportError:
     print("solar_data.py must be in the same directory.")
@@ -59,8 +61,12 @@ def load_config() -> Dict[str, Any]:
     """Load configuration from .env (or environment variables)."""
     load_dotenv()
 
+    serial_hint = os.getenv("SERIAL_DEVICE")
+    serial_device = resolve_serial_device(serial_hint)
+
     cfg = {
-        "serial_device": os.getenv("SERIAL_DEVICE", "/dev/ttyACM0"),
+        "serial_device": serial_device,
+        "serial_device_hint": serial_hint,
         "mqtt_host": os.getenv("MQTT_HOST", "localhost"),
         "mqtt_port": int(os.getenv("MQTT_PORT", "1883")),
         "mqtt_username": os.getenv("MQTT_USERNAME") or None,
@@ -72,7 +78,13 @@ def load_config() -> Dict[str, Any]:
         "device_id": os.getenv("DEVICE_ID", "solartracer_pi"),
         "manufacturer": os.getenv("MANUFACTURER", "EPEVER"),
         "model": os.getenv("MODEL", "Tracer BN Series"),
-        "publish_interval": int(os.getenv("PUBLISH_INTERVAL", "30")),
+        "publish_interval": int(os.getenv("PUBLISH_INTERVAL", "60")),
+        "voltage_sample_interval": float(
+            os.getenv("VOLTAGE_SAMPLE_INTERVAL", os.getenv("PUBLISH_INTERVAL", "60"))
+        ),
+        "config_refresh_sec": float(os.getenv("CONFIG_REFRESH_SEC", "300")),
+        "unreachable_poll_interval": int(os.getenv("UNREACHABLE_POLL_INTERVAL", "120")),
+        "discovery_refresh_sec": float(os.getenv("DISCOVERY_REFRESH_SEC", "3600")),
     }
     return cfg
 
@@ -319,6 +331,28 @@ SWITCH_DISCOVERY_MAP = {
     "lights_on": ("Lights Relay", "on", "off"),
 }
 
+# Charger configuration (holding registers, refreshed periodically).
+CONFIG_DISCOVERY_MAP = {
+    "battery_capacity_ah": ("Battery Capacity", "Ah", None, "measurement"),
+    "float_voltage": ("Float Voltage Setpoint", "V", "voltage", "measurement"),
+    "boost_voltage": ("Boost Voltage Setpoint", "V", "voltage", "measurement"),
+    "equalization_voltage": ("Equalization Voltage Setpoint", "V", "voltage", "measurement"),
+    "charging_limit_voltage": ("Charging Limit Voltage", "V", "voltage", "measurement"),
+    "boost_reconnect_voltage": ("Boost Reconnect Voltage", "V", "voltage", "measurement"),
+    "low_voltage_reconnect": ("Low Voltage Reconnect", "V", "voltage", "measurement"),
+    "under_voltage_recover": ("Under Voltage Recover", "V", "voltage", "measurement"),
+    "under_voltage_warning": ("Under Voltage Warning", "V", "voltage", "measurement"),
+    "low_voltage_disconnect": ("Low Voltage Disconnect", "V", "voltage", "measurement"),
+    "discharging_limit_voltage": ("Discharging Limit Voltage", "V", "voltage", "measurement"),
+    "night_time_threshold_voltage": ("Night Threshold Voltage", "V", "voltage", "measurement"),
+    "day_time_threshold_voltage": ("Day Threshold Voltage", "V", "voltage", "measurement"),
+    "discharging_percentage": ("Discharge Depth Limit", "%", None, "measurement"),
+    "charging_percentage": ("Charge Depth Limit", "%", None, "measurement"),
+    "battery_type_name": ("Battery Type", None, None, None),
+    "battery_rated_voltage_name": ("Battery Rated Voltage", None, None, None),
+    "management_mode_name": ("Management Mode", None, None, None),
+}
+
 # Retired HA entity (coil 0 is not in the Tracer BN protocol).
 RETIRED_ENTITIES = ("charging_enabled_coil",)
 
@@ -337,14 +371,59 @@ EXTRA_STATE_KEYS = (
     "system_rated_voltage",
 )
 
-CONFIG_REFRESH_SEC = 60.0
 UNREACHABLE_CLEAR_THRESHOLD = 3
+SERIAL_RESCAN_INTERVAL_SEC = 30.0
+
+
+def _maybe_rescan_serial(cfg: Dict[str, Any], runtime: Dict[str, Any]) -> bool:
+    """Re-detect the Exar port after USB replug (ttyACM number may change)."""
+    now = time.time()
+    if now - runtime.get("last_serial_scan", 0.0) < SERIAL_RESCAN_INTERVAL_SEC:
+        return False
+    runtime["last_serial_scan"] = now
+    device, changed, message = rescan_serial_device(
+        cfg["serial_device"],
+        cfg.get("serial_device_hint"),
+        runtime.get("serial_device_realpath"),
+    )
+    if changed:
+        print(message)
+        cfg["serial_device"] = device
+        runtime["serial_device_realpath"] = device_realpath(device)
+        runtime["consecutive_failures"] = 0
+        return True
+    return False
+
+
+def _poll_intervals(cfg: Dict[str, Any], runtime: Dict[str, Any]) -> tuple:
+    """Return (publish_interval, voltage_sample_interval), slower when unreachable."""
+    failures = runtime.get("consecutive_failures", 0)
+    if failures >= UNREACHABLE_CLEAR_THRESHOLD:
+        slow = cfg["unreachable_poll_interval"]
+        return slow, slow
+    return cfg["publish_interval"], cfg["voltage_sample_interval"]
+
+
+def _needs_extra_voltage_sample(
+    cfg: Dict[str, Any],
+    last_publish: float,
+    last_sample: float,
+    now: float,
+) -> bool:
+    """Skip redundant reads when a full publish already sampled voltage recently."""
+    voltage_iv = cfg["voltage_sample_interval"]
+    if now - last_sample < voltage_iv:
+        return False
+    if voltage_iv >= cfg["publish_interval"]:
+        return False
+    return now - last_publish >= voltage_iv
 
 ALL_STATE_KEYS = (
     tuple(DISCOVERY_MAP.keys())
     + tuple(BINARY_DISCOVERY_MAP.keys())
     + tuple(SELECT_DISCOVERY_MAP.keys())
     + tuple(SWITCH_DISCOVERY_MAP.keys())
+    + tuple(CONFIG_DISCOVERY_MAP.keys())
     + EXTRA_STATE_KEYS
     + ("last_update",)
 )
@@ -399,6 +478,8 @@ def publish_all_discoveries(client: mqtt.Client, cfg: Dict[str, Any]):
         publish_select_discovery(client, cfg, key, name, options)
     for key, (name, p_on, p_off) in SWITCH_DISCOVERY_MAP.items():
         publish_switch_discovery(client, cfg, key, name, p_on, p_off)
+    for key, (name, unit, device_class, state_class) in CONFIG_DISCOVERY_MAP.items():
+        publish_discovery(client, cfg, key, name, unit, device_class, state_class)
     publish_binary_discovery(
         client,
         cfg,
@@ -411,10 +492,6 @@ def publish_all_discoveries(client: mqtt.Client, cfg: Dict[str, Any]):
     )
 
 
-def _config_has_values(config: Dict[str, Any]) -> bool:
-    return any(v is not None for k, v in config.items() if not k.endswith("_name"))
-
-
 def publish_states(
     client: mqtt.Client,
     cfg: Dict[str, Any],
@@ -425,12 +502,15 @@ def publish_states(
 ) -> float:
     """Read current data and publish all states + discovery (including switches for control)."""
     now = time.time()
+    if runtime.get("consecutive_failures", 0) > 0:
+        _maybe_rescan_serial(cfg, runtime)
+
     need_config = (
         not cached_config
-        or (now - last_config_read) >= CONFIG_REFRESH_SEC
+        or (now - last_config_read) >= cfg["config_refresh_sec"]
     )
     data = get_solar_data(device=cfg["serial_device"], include_config=need_config)
-    if need_config and data.get("config") and _config_has_values(data["config"]):
+    if need_config and data.get("config") and config_has_values(data["config"]):
         cached_config.clear()
         cached_config.update(data["config"])
         last_config_read = now
@@ -438,6 +518,9 @@ def publish_states(
         data["config"] = dict(cached_config)
     data["battery_level_pct"] = compute_battery_level_pct(data, data.get("config"))
     telemetry.record_charger_sample(data)
+    pack_v = data.get("battery_voltage")
+    if pack_v is not None:
+        telemetry.add_voltage_sample(pack_v)
 
     time_label, time_seconds = display_time_remaining(
         data, telemetry.voltage_history, telemetry.rate_log,
@@ -448,9 +531,10 @@ def publish_states(
     if not is_charger_reachable(data):
         runtime["consecutive_failures"] = runtime.get("consecutive_failures", 0) + 1
         failures = runtime["consecutive_failures"]
+        _maybe_rescan_serial(cfg, runtime)
         print(
             f"WARNING: Charger unreachable ({failures}/{UNREACHABLE_CLEAR_THRESHOLD}) "
-            "- keeping last MQTT states"
+            f"on {cfg['serial_device']} — keeping last MQTT states"
         )
         if failures >= UNREACHABLE_CLEAR_THRESHOLD:
             publish_charger_reachability(client, cfg, False)
@@ -459,9 +543,9 @@ def publish_states(
         return last_config_read
 
     runtime["consecutive_failures"] = 0
-    if not runtime.get("was_reachable", True):
-        publish_charger_reachability(client, cfg, True)
     runtime["was_reachable"] = True
+    # Always refresh availability while reachable (broker may retain a stale false).
+    publish_charger_reachability(client, cfg, True)
 
     def _to_onoff(v):
         if v is None:
@@ -491,6 +575,12 @@ def publish_states(
             continue
         publish_value(client, f"{base_topic}/{key}", value, retain=True)
 
+    config = data.get("config")
+    if config:
+        for key in CONFIG_MQTT_KEYS:
+            if key in config:
+                publish_value(client, f"{base_topic}/{key}", config[key], retain=True)
+
     last_update = time.strftime("%Y-%m-%d %H:%M:%S")
     publish_value(client, f"{base_topic}/last_update", last_update, retain=True)
 
@@ -499,7 +589,6 @@ def publish_states(
     except OSError as exc:
         print(f"Failed to persist telemetry: {exc}")
 
-    publish_all_discoveries(client, cfg)
     return last_config_read
 
 
@@ -508,9 +597,15 @@ def main():
     dry_run = os.getenv("DRY_RUN", "").lower() in ("1", "true", "yes")
 
     print("=== SolarTracer MQTT Publisher (daemon mode for HA control) ===")
-    print(f"Serial device: {cfg['serial_device']}")
+    hint = cfg.get("serial_device_hint")
+    if hint and hint.strip().lower() not in ("", "auto"):
+        print(f"Serial device: {cfg['serial_device']} (hint: {hint})")
+    else:
+        print(f"Serial device: {cfg['serial_device']} (auto-detected)")
     print(f"MQTT base topic: {cfg['mqtt_base_topic']}")
     print(f"Publish interval: {cfg['publish_interval']}s")
+    print(f"Voltage sample interval: {cfg['voltage_sample_interval']}s")
+    print(f"Unreachable poll interval: {cfg['unreachable_poll_interval']}s")
     print(f"HA Discovery prefix: {cfg['mqtt_ha_discovery_prefix'] or '(disabled)'}")
     if dry_run:
         print("DRY_RUN mode - no MQTT connection")
@@ -526,9 +621,11 @@ def main():
     last_config_read = 0.0
     last_sample = 0.0
     last_publish = 0.0
+    last_discovery = 0.0
     runtime: Dict[str, Any] = {
         "consecutive_failures": 0,
-        "was_reachable": True,
+        "was_reachable": None,
+        "serial_device_realpath": device_realpath(cfg["serial_device"]),
     }
 
     # Subscribe to command topics so HA can control lights
@@ -536,6 +633,7 @@ def main():
     client.subscribe(f"{base_topic}/lights_mode/set")
 
     def on_message(client, userdata, msg):
+        nonlocal last_config_read
         payload = msg.payload.decode().strip().lower()
         topic = msg.topic
         print(f"Received command: {topic} = {payload}")
@@ -556,13 +654,11 @@ def main():
 
     client.on_message = on_message
 
-    # Background thread for receiving MQTT messages (commands)
-    client.loop_start()
-
     print("Subscribed to command topics. Starting periodic state publishing...")
 
     # Register HA entities (availability + reachability sensor) before first read.
     publish_all_discoveries(client, cfg)
+    last_discovery = time.time()
 
     def sample_voltage_history() -> None:
         nonlocal last_sample
@@ -582,18 +678,28 @@ def main():
     )
     last_publish = time.time()
 
-    # Sample voltage every 5s for trend/time-remaining; full publish on interval.
+    # Sample voltage between full publishes when needed; full publish on interval.
     try:
         while True:
             now = time.time()
-            if now - last_sample >= HISTORY_SAMPLE_INTERVAL:
+            publish_iv, _ = _poll_intervals(cfg, runtime)
+
+            if _needs_extra_voltage_sample(cfg, last_publish, last_sample, now):
                 sample_voltage_history()
 
-            if now - last_publish >= cfg["publish_interval"]:
+            if now - last_publish >= publish_iv:
                 last_config_read = publish_states(
                     client, cfg, telemetry, cached_config, last_config_read, runtime,
                 )
                 last_publish = now
+                last_sample = now
+
+            if (
+                cfg["mqtt_ha_discovery_prefix"]
+                and now - last_discovery >= cfg["discovery_refresh_sec"]
+            ):
+                publish_all_discoveries(client, cfg)
+                last_discovery = now
 
             time.sleep(1)
     except KeyboardInterrupt:

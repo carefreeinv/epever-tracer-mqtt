@@ -112,7 +112,7 @@ def main():
     time.sleep(1.2)
 
     print("RS-485 signaling mode activated (gpio_mode=0x0b).")
-    print("Use /dev/ttyACM0 with 115200 8N1 RTU (slave 1).")
+    print("Use /dev/solartracer-rs485 (or the ttyACM node) with 115200 8N1 RTU (slave 1).")
     return 0
 
 if __name__ == "__main__":

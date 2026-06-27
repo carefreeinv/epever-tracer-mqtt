@@ -26,7 +26,8 @@ CHARGE_AMP_THRESHOLD = 0.05
 VOLTAGE_TREND_THRESHOLD = 0.03
 STATUS_WINDOW_SEC = 180.0
 STATUS_MIN_SPAN_SEC = 150.0
-HISTORY_SAMPLE_INTERVAL = 5.0
+HISTORY_SAMPLE_INTERVAL = float(os.getenv("VOLTAGE_SAMPLE_INTERVAL", "30"))
+MODBUS_INTER_READ_DELAY_SEC = float(os.getenv("MODBUS_INTER_READ_DELAY_SEC", "0.05"))
 # Short lookback used to override stale charge trends after discharge starts.
 RECENT_TREND_LOOKBACK_SEC = 90.0
 RECENT_TREND_MIN_SPAN_SEC = 30.0
@@ -86,6 +87,29 @@ CONFIG_REGISTERS = [
     (0x901E, 2, "night_time_threshold_voltage"),
     (0x9020, 2, "day_time_threshold_voltage"),
 ]
+
+CONFIG_LABEL_KEYS = (
+    "battery_type_name",
+    "battery_rated_voltage_name",
+    "management_mode_name",
+)
+CONFIG_MQTT_KEYS = tuple(key for _, _, key in CONFIG_REGISTERS) + CONFIG_LABEL_KEYS
+
+
+def config_from_flat_data(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Rebuild the nested config dict from flat MQTT topic keys."""
+    return {
+        key: data[key]
+        for key in CONFIG_MQTT_KEYS
+        if key in data and data[key] is not None
+    }
+
+
+def config_has_values(config: Dict[str, Any]) -> bool:
+    """True when at least one non-label config field is present."""
+    return any(
+        v is not None for k, v in config.items() if not k.endswith("_name")
+    )
 
 
 def derive_is_night(
@@ -1210,6 +1234,17 @@ def setup_instrument(device: str = "/dev/ttyACM0", slave: int = 1, timeout: floa
     return instrument
 
 
+def close_instrument(instrument: Optional[minimalmodbus.Instrument]) -> None:
+    """Release the tty so USB replugs can be picked up by the next open."""
+    if instrument is None:
+        return
+    try:
+        if instrument.serial.is_open:
+            instrument.serial.close()
+    except Exception:
+        pass
+
+
 def read_register_safe(
     instrument: minimalmodbus.Instrument,
     address: int,
@@ -1249,6 +1284,8 @@ def read_charger_config(instrument: minimalmodbus.Instrument) -> Dict[str, Any]:
     config: Dict[str, Any] = {}
     for address, decimals, key in CONFIG_REGISTERS:
         config[key] = read_register_safe(instrument, address, decimals, functioncode=3)
+        if MODBUS_INTER_READ_DELAY_SEC > 0:
+            time.sleep(MODBUS_INTER_READ_DELAY_SEC)
     config.update(_decode_config_labels(config))
     return config
 
@@ -1327,7 +1364,12 @@ def _decode_charging_status(raw_value: Optional[Union[int, float]]) -> Dict[str,
     }
 
 
-def get_solar_data(device: Optional[str] = None, include_config: bool = False) -> Dict[str, Any]:
+def get_solar_data(
+    device: Optional[str] = None,
+    include_config: bool = False,
+    lock_timeout: float = 15.0,
+    quiet: bool = False,
+) -> Dict[str, Any]:
     """
     Read all defined registers from the solar charger.
 
@@ -1345,25 +1387,33 @@ def get_solar_data(device: Optional[str] = None, include_config: bool = False) -
 
     data: Dict[str, Optional[float]] = {}
 
+    instrument: Optional[minimalmodbus.Instrument] = None
     try:
-        with serial_lock(device):
+        with serial_lock(device, timeout=lock_timeout):
             try:
                 instrument = setup_instrument(device)
             except Exception as e:
                 print(f"Failed to open serial device {device}: {e}")
                 raise
 
+            def _read_registers(reg_list, status=False):
+                for entry in reg_list:
+                    if status:
+                        address, decimals, key = entry
+                    else:
+                        address, decimals, key, *_ = entry
+                    data[key] = read_register_safe(instrument, address, decimals)
+                    if MODBUS_INTER_READ_DELAY_SEC > 0:
+                        time.sleep(MODBUS_INTER_READ_DELAY_SEC)
+
             # Read main realtime + daily registers
-            for address, decimals, key, *_ in REGISTERS:
-                data[key] = read_register_safe(instrument, address, decimals)
+            _read_registers(REGISTERS)
 
             # Read extra rated registers
-            for address, decimals, key, *_ in EXTRA_REGISTERS:
-                data[key] = read_register_safe(instrument, address, decimals)
+            _read_registers(EXTRA_REGISTERS)
 
             # Read status registers (as integers)
-            for address, decimals, key in STATUS_REGISTERS:
-                data[key] = read_register_safe(instrument, address, decimals)
+            _read_registers(STATUS_REGISTERS, status=True)
 
             # Add derived charging state
             charging_info = _decode_charging_status(data.get("charging_equipment_status"))
@@ -1374,15 +1424,20 @@ def get_solar_data(device: Optional[str] = None, include_config: bool = False) -
             dttv: Optional[float] = None
             try:
                 load_mode = instrument.read_register(0x903D, 0, functioncode=3)
+                if MODBUS_INTER_READ_DELAY_SEC > 0:
+                    time.sleep(MODBUS_INTER_READ_DELAY_SEC)
                 data["load_control_mode"] = load_mode
                 data["lights_manual_mode"] = (load_mode == LOAD_CONTROL_MODE_MANUAL)
                 load_default = instrument.read_register(0x906A, 0, functioncode=3)
+                if MODBUS_INTER_READ_DELAY_SEC > 0:
+                    time.sleep(MODBUS_INTER_READ_DELAY_SEC)
                 if load_mode == LOAD_CONTROL_MODE_MANUAL:
                     data["lights_on"] = bool(load_default)
                 else:
-                    load_a = data.get("load_current")
-                    data["lights_on"] = float(load_a or 0) > 0.05 if load_a is not None else None
+                    data["lights_on"] = None
                 nttv = instrument.read_register(0x901E, 2, functioncode=3)
+                if MODBUS_INTER_READ_DELAY_SEC > 0:
+                    time.sleep(MODBUS_INTER_READ_DELAY_SEC)
                 dttv = instrument.read_register(0x9020, 2, functioncode=3)
             except Exception:
                 data["load_control_mode"] = None
@@ -1393,13 +1448,20 @@ def get_solar_data(device: Optional[str] = None, include_config: bool = False) -
             data["day_time_threshold_voltage"] = dttv
             data["is_night"] = derive_is_night(data.get("pv_voltage"), nttv, dttv)
 
+            relay = lights_relay_engaged(data)
+            if relay is not None:
+                data["lights_on"] = relay
+
             if include_config:
                 data["config"] = read_charger_config(instrument)
 
             data["lights_state"] = get_lights_state(data)
             data["battery_level_pct"] = compute_battery_level_pct(data)
+            close_instrument(instrument)
+            instrument = None
     except (TimeoutError, OSError) as e:
-        print(f"RS-485 access failed for {device}: {e}")
+        if not quiet:
+            print(f"RS-485 access failed for {device}: {e}")
         for _, _, key, *_ in REGISTERS + EXTRA_REGISTERS:
             data[key] = None
         for _, _, key in STATUS_REGISTERS:
@@ -1410,6 +1472,8 @@ def get_solar_data(device: Optional[str] = None, include_config: bool = False) -
             data["config"] = {key: None for _, _, key in CONFIG_REGISTERS}
         data["battery_level_pct"] = None
     except Exception as e:
+        close_instrument(instrument)
+        instrument = None
         print(f"Failed to open serial device {device}: {e}")
         for _, _, key, *_ in REGISTERS + EXTRA_REGISTERS:
             data[key] = None
@@ -1420,6 +1484,8 @@ def get_solar_data(device: Optional[str] = None, include_config: bool = False) -
         if include_config:
             data["config"] = {key: None for _, _, key in CONFIG_REGISTERS}
         data["battery_level_pct"] = None
+    finally:
+        close_instrument(instrument)
 
     return data
 
@@ -1457,13 +1523,55 @@ def get_lights_state(data: Optional[Dict[str, Any]] = None) -> str:
     return "off"
 
 
+def _coerce_on_off(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in ("on", "true", "1"):
+        return True
+    if text in ("off", "false", "0"):
+        return False
+    return None
+
+
+def lights_relay_engaged(data: Dict[str, Any]) -> Optional[bool]:
+    """Whether the load output relay is energized."""
+    mode = data.get("load_control_mode")
+    if mode is not None and int(mode) == LOAD_CONTROL_MODE_MANUAL:
+        return _coerce_on_off(data.get("lights_on"))
+
+    load_a = data.get("load_current")
+    if load_a is not None and float(load_a) > 0.05:
+        return True
+
+    if mode is not None and int(mode) == LOAD_CONTROL_MODE_LIGHT_ON_OFF:
+        night = data.get("is_night")
+        if night is True:
+            return True
+        if night is False:
+            return False
+
+    return _coerce_on_off(data.get("lights_on"))
+
+
+def lights_auto_label(data: Dict[str, Any]) -> str:
+    """Auto mode label with relay prefix, e.g. ON-AUTO or OFF-AUTO."""
+    relay = lights_relay_engaged(data)
+    prefix = "ON" if relay else "OFF"
+    return f"{prefix}-AUTO"
+
+
 def lights_state_label(data: Dict[str, Any], compact: bool = False) -> str:
     """Human-readable lights mode for display."""
     state = data.get("lights_state") or get_lights_state(data)
     if state == "auto":
-        relay = "on" if data.get("lights_on") else "off"
         if compact:
-            return f"AUTO/{relay}"
+            return lights_auto_label(data)
+        relay = "on" if lights_relay_engaged(data) else "off"
         mode = data.get("load_control_mode")
         mode_name = (
             LOAD_CONTROL_MODE_NAMES.get(int(mode), "day/night")

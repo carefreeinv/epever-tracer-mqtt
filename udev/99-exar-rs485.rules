@@ -1,4 +1,11 @@
-# Automatically configure the Exar XR21B1411 RS-485 USB stick for EPEVER Tracer
-# controllers (gpio_mode=0x0b). Install with scripts/install.sh.
-SUBSYSTEM=="usb", ATTR{idVendor}=="04e2", ATTR{idProduct}=="1411", \
+# Stable symlink for the Exar XR21B1411 RS-485 USB adapter.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="04e2", ATTRS{idProduct}=="1411", \
+    SYMLINK+="solartracer-rs485", GROUP="dialout", MODE="0660"
+
+# Configure RS-485 half-duplex mode when the adapter is plugged in.
+SUBSYSTEM=="usb", ATTR{idVendor}=="04e2", ATTR{idProduct}=="1411", ACTION=="add", \
     RUN+="@REPO_DIR@/configure-exar-rs485.py"
+
+# Restart the MQTT publisher after replug so it drops stale tty handles.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="04e2", ATTRS{idProduct}=="1411", ACTION=="add", \
+    TAG+="systemd", ENV{SYSTEMD_WANTS}+="solartracer-mqtt.service"

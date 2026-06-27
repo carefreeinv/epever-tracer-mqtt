@@ -3,7 +3,8 @@
 dashboard.py
 
 Full-screen terminal dashboard for the EPEVER/Tracer BN solar charger.
-Uses partial screen updates, sparkline graphs, and percentage gauges.
+Reads live state from MQTT (solartracer-mqtt.service) and trend/history
+artifacts under ./var. Does not use RS-485 — the MQTT publisher owns serial.
 
 Usage:
     python3 dashboard.py              # full-screen live dashboard
@@ -17,6 +18,7 @@ import argparse
 import curses
 import os
 import sys
+import threading
 import time
 from collections import deque
 from typing import Any, Deque, Dict, List, Optional, Tuple
@@ -27,13 +29,16 @@ except ImportError:
     load_dotenv = None  # type: ignore
 
 from solar_data import (
+    CONFIG_LABEL_KEYS,
+    LIGHTS_STATES,
     TimedMetricHistory,
     compute_battery_level_pct,
     compute_display_status,
+    config_from_flat_data,
+    config_has_values,
     display_time_remaining,
-    cycle_lights_state,
     get_lights_state,
-    get_solar_data,
+    lights_auto_label,
     is_charger_reachable,
     lights_state_label,
     tracer_is_charging,
@@ -46,13 +51,247 @@ GAUGE_EMPTY = "░"
 
 HISTORY_LEN = 64
 DEFAULT_INTERVAL = 5.0
-CONFIG_REFRESH_SEC = 60.0
+MQTT_FETCH_TIMEOUT = 1.0
+MQTT_STARTUP_TIMEOUT = 1.0
+
+_BOOL_KEYS = frozenset({
+    "is_charging", "lights_on", "lights_manual_mode", "charger_reachable",
+})
+_STRING_KEYS = frozenset({
+    "charging_status", "lights_mode", "lights_state", "time_remaining",
+    *CONFIG_LABEL_KEYS,
+})
 
 
-def load_serial_device() -> str:
+def _load_env() -> None:
     if load_dotenv is not None:
         load_dotenv()
-    return os.getenv("SERIAL_DEVICE", "/dev/ttyACM0")
+
+
+def _mqtt_settings() -> Dict[str, Any]:
+    _load_env()
+    return {
+        "host": os.getenv("MQTT_HOST", "localhost"),
+        "port": int(os.getenv("MQTT_PORT", "1883")),
+        "username": os.getenv("MQTT_USERNAME") or None,
+        "password": os.getenv("MQTT_PASSWORD") or None,
+        "base_topic": os.getenv("MQTT_BASE_TOPIC", "solartracer").rstrip("/"),
+    }
+
+
+def _parse_mqtt_value(key: str, raw: str) -> Any:
+    if not raw:
+        return None
+    if key == "is_night":
+        return raw == "true"
+    if key in _BOOL_KEYS:
+        return raw in ("on", "true", "1")
+    if key in _STRING_KEYS:
+        return raw
+    try:
+        return float(raw) if "." in raw else int(raw)
+    except ValueError:
+        return raw
+
+
+class MqttStateCache:
+    """Persistent MQTT subscriber — avoids reconnecting on every dashboard refresh."""
+
+    def __init__(self) -> None:
+        self._state: Dict[str, Any] = {}
+        self._lock = threading.Lock()
+        self._ready = threading.Event()
+        self._prefix = ""
+        self._client: Any = None
+
+    def _on_connect(self, client, userdata, flags, reason_code, properties=None):
+        client.subscribe(f"{self._prefix}#")
+
+    def _on_message(self, client, userdata, msg):
+        if not msg.topic.startswith(self._prefix):
+            return
+        key = msg.topic[len(self._prefix):]
+        if "/" in key:
+            return
+        value = _parse_mqtt_value(key, msg.payload.decode(errors="replace").strip())
+        with self._lock:
+            self._state[key] = value
+        self._ready.set()
+
+    def start(self, startup_timeout: float = MQTT_STARTUP_TIMEOUT) -> bool:
+        try:
+            import paho.mqtt.client as mqtt
+            from paho.mqtt.client import CallbackAPIVersion
+        except ImportError:
+            return False
+
+        cfg = _mqtt_settings()
+        self._prefix = cfg["base_topic"] + "/"
+        client = mqtt.Client(
+            CallbackAPIVersion.VERSION2,
+            client_id=f"solartracer-dashboard-{os.getpid()}",
+        )
+        client.on_connect = self._on_connect
+        client.on_message = self._on_message
+        if cfg["username"]:
+            client.username_pw_set(cfg["username"], cfg["password"])
+        client.connect(cfg["host"], cfg["port"], keepalive=60)
+        client.loop_start()
+        self._client = client
+        self._ready.wait(timeout=startup_timeout)
+        return self.has_data()
+
+    def stop(self) -> None:
+        if self._client is None:
+            return
+        self._client.loop_stop()
+        self._client.disconnect()
+        self._client = None
+
+    def has_data(self) -> bool:
+        with self._lock:
+            return bool(self._state)
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            return dict(self._state)
+
+    def patch(self, updates: Dict[str, Any]) -> None:
+        """Optimistic local updates while waiting for the publisher to refresh."""
+        with self._lock:
+            self._state.update(updates)
+
+
+def fetch_mqtt_state(timeout: float = MQTT_FETCH_TIMEOUT) -> Dict[str, Any]:
+    """One-shot MQTT read (used by --once). Live TUI uses MqttStateCache instead."""
+    try:
+        import paho.mqtt.client as mqtt
+        from paho.mqtt.client import CallbackAPIVersion
+    except ImportError:
+        return {}
+
+    cfg = _mqtt_settings()
+    prefix = cfg["base_topic"] + "/"
+    state: Dict[str, Any] = {}
+
+    def on_connect(client, userdata, flags, reason_code, properties=None):
+        client.subscribe(f"{prefix}#")
+
+    def on_message(client, userdata, msg):
+        if not msg.topic.startswith(prefix):
+            return
+        key = msg.topic[len(prefix):]
+        if "/" in key:
+            return
+        state[key] = _parse_mqtt_value(key, msg.payload.decode(errors="replace").strip())
+
+    client = mqtt.Client(CallbackAPIVersion.VERSION2, client_id="solartracer-dashboard")
+    client.on_connect = on_connect
+    client.on_message = on_message
+    if cfg["username"]:
+        client.username_pw_set(cfg["username"], cfg["password"])
+
+    try:
+        client.connect(cfg["host"], cfg["port"], keepalive=30)
+        client.loop_start()
+        time.sleep(timeout)
+        client.loop_stop()
+        client.disconnect()
+    except Exception:
+        return {}
+
+    return state
+
+
+def load_artifact_snapshot() -> Dict[str, Any]:
+    """Last-known samples from publisher history files (fallback when MQTT is down)."""
+    try:
+        store = TelemetryStore.load()
+        data: Dict[str, Any] = {}
+        if store.voltage_history.samples:
+            _, voltage = store.voltage_history.samples[-1]
+            data["battery_voltage"] = voltage
+        rate_log = store.rate_log
+        if rate_log.samples:
+            _ts, _voltage, soc, _mode = rate_log.samples[-1]
+            if soc is not None:
+                data["battery_level_pct"] = soc
+        return data
+    except OSError:
+        return {}
+
+
+def publish_mqtt_command(subtopic: str, payload: str) -> None:
+    """Send a command topic handled by solartracer-mqtt.service."""
+    try:
+        import paho.mqtt.client as mqtt
+        from paho.mqtt.client import CallbackAPIVersion
+    except ImportError as exc:
+        raise RuntimeError("paho-mqtt is required for lights control") from exc
+
+    cfg = _mqtt_settings()
+    client = mqtt.Client(CallbackAPIVersion.VERSION2, client_id="solartracer-dashboard-cmd")
+    if cfg["username"]:
+        client.username_pw_set(cfg["username"], cfg["password"])
+    client.connect(cfg["host"], cfg["port"], keepalive=30)
+    client.publish(f"{cfg['base_topic']}/{subtopic}", payload, qos=0)
+    client.loop_start()
+    time.sleep(0.2)
+    client.loop_stop()
+    client.disconnect()
+
+
+def _lights_mode_patch(next_state: str) -> Dict[str, Any]:
+    """MQTT fields that reflect a lights mode change before the next publish."""
+    patch: Dict[str, Any] = {
+        "lights_mode": next_state,
+        "lights_state": next_state,
+    }
+    if next_state == "auto":
+        patch["load_control_mode"] = 1
+        patch["lights_manual_mode"] = False
+    else:
+        patch["load_control_mode"] = 0
+        patch["lights_manual_mode"] = True
+        patch["lights_on"] = next_state == "on"
+    return patch
+
+
+def cycle_lights_via_mqtt(data: Dict[str, Any]) -> str:
+    """Advance lights mode via MQTT (off → auto → on → off)."""
+    current = data.get("lights_mode")
+    if current not in LIGHTS_STATES:
+        current = get_lights_state(data)
+    if current not in LIGHTS_STATES:
+        current = "off"
+    next_state = LIGHTS_STATES[(LIGHTS_STATES.index(current) + 1) % len(LIGHTS_STATES)]
+    publish_mqtt_command("lights_mode/set", next_state)
+    return next_state
+
+
+def fetch_charger_data(
+    mqtt_cache: Optional[MqttStateCache] = None,
+) -> Tuple[Dict[str, Any], str]:
+    """Return (data, source). Never touches RS-485."""
+    if mqtt_cache is not None:
+        data = mqtt_cache.snapshot()
+    else:
+        data = fetch_mqtt_state()
+    if data:
+        data["config"] = config_from_flat_data(data)
+        if is_charger_reachable(data):
+            data["battery_level_pct"] = compute_battery_level_pct(data, data.get("config"))
+            return data, "mqtt"
+        if data.get("charger_reachable") in (False, "false"):
+            data["battery_level_pct"] = compute_battery_level_pct(data, data.get("config"))
+            return data, "mqtt"
+
+    artifact = load_artifact_snapshot()
+    if artifact:
+        artifact["battery_level_pct"] = compute_battery_level_pct(artifact, artifact.get("config"))
+        return artifact, "artifacts"
+
+    return data or {}, "none"
 
 
 def _pv_power_w(data: Dict[str, Any]) -> float:
@@ -96,13 +335,13 @@ def _format_temp(celsius: Optional[float], use_fahrenheit: bool) -> str:
     return f"{celsius:.1f}°C"
 
 
-def _config_lines(data: Dict[str, Any], width: int, device: str) -> List[str]:
+def _config_lines(data: Dict[str, Any], width: int, source_label: str) -> List[str]:
     """Format read-only charger configuration for the dashboard."""
     cfg = data.get("config") or {}
-    if not cfg or not any(v is not None for k, v in cfg.items() if not k.endswith("_name")):
+    if not config_has_values(cfg):
         return [
-            _inner_line(" Config unavailable ", width),
-            _inner_line(f" Device  {device} ", width),
+            _inner_line(" Config unavailable (not published to MQTT) ", width),
+            _inner_line(f" Source  {source_label} ", width),
         ]
 
     sys_v = data.get("system_rated_voltage")
@@ -140,7 +379,7 @@ def _config_lines(data: Dict[str, Any], width: int, device: str) -> List[str]:
         _inner_line(line2, width),
         _inner_line(line3, width),
         _inner_line(line4, width),
-        _inner_line(f" Device  {device} ", width),
+        _inner_line(f" Source  {source_label} ", width),
     ]
 
 
@@ -159,13 +398,16 @@ def _lights_label(data: Dict[str, Any], compact: bool = False) -> str:
     return lights_state_label(data, compact=compact)
 
 
-def _lights_gauge_pct(data: Dict[str, Any]) -> float:
+def _lights_row_value(data: Dict[str, Any]) -> str:
+    """Value column for the Lights gauge row."""
     state = data.get("lights_state") or get_lights_state(data)
+    if state == "auto":
+        return lights_auto_label(data)
     if state == "on":
-        return 100.0
+        return "ON"
     if state == "off":
-        return 0.0
-    return 100.0 if data.get("lights_on") else 0.0
+        return "OFF"
+    return "—"
 
 
 class MetricHistory:
@@ -231,15 +473,17 @@ class Histories:
     def battery_rate_log(self):
         return self.telemetry.rate_log
 
+    def reload_artifacts(self) -> None:
+        """Reload trend/rate history written by solartracer-mqtt.service."""
+        self.telemetry = TelemetryStore.load()
+
     def update(self, data: Dict[str, Any]) -> None:
+        """Update on-screen sparklines only (does not write artifact files)."""
         self.pv_power.add(_pv_power_w(data))
         self.battery_level.add(_battery_level_pct(data))
-        self.telemetry.voltage_history.add(data.get("battery_voltage"))
-        self.telemetry.record_charger_sample(data)
         self.battery_current.add(abs(data.get("battery_current") or 0.0))
         self.load_current.add(data.get("load_current"))
         self.generated_kwh.add(data.get("generated_energy_today"))
-        self.telemetry.persist_quiet()
 
 
 def render_gauge(pct: float, width: int) -> str:
@@ -344,14 +588,26 @@ def _inner_line(content: str, width: int, center: bool = False) -> str:
     return "│" + text[:inner_w] + "│"
 
 
+def _source_label(data_source: str) -> str:
+    cfg = _mqtt_settings()
+    topic = cfg["base_topic"]
+    if data_source == "mqtt":
+        return f"MQTT {topic}/#"
+    if data_source == "artifacts":
+        paths = TelemetryStore.load().paths
+        return f"files {paths.base_dir}/"
+    return "unavailable"
+
+
 def build_layout(
     data: Dict[str, Any],
-    device: str,
     histories: Histories,
     width: int,
     height: int,
     interval: float,
     use_fahrenheit: bool = False,
+    data_source: str = "mqtt",
+    loading: bool = False,
 ) -> List[Tuple[int, str, int]]:
     """Return list of (row, text, attr) for the current frame."""
     now = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -366,13 +622,24 @@ def build_layout(
     ts = f" {now} "
     add(0, _box_top(w, title, ts), 0)
 
-    if not is_charger_reachable(data):
-        add(2, _inner_line("Charger unreachable — no RS-485 response", w, center=True), 0)
-        add(5, _inner_line("Check USB adapter, wiring, and .env SERIAL_DEVICE", w), 0)
-        add(7, _inner_line(f"Device: {device}", w), 0)
-        add(8, _inner_line(f"Retrying every {interval:.0f}s — press q to quit", w, center=True), 0)
+    source_label = _source_label(data_source)
+
+    if loading:
+        add(2, _inner_line("Reading from MQTT…", w, center=True), 0)
+        add(4, _inner_line(source_label, w, center=True), 0)
         add(height - 2, _box_bottom(w, "press q to quit"), 0)
         return lines
+
+    if not is_charger_reachable(data):
+        add(2, _inner_line("Charger unreachable", w, center=True), 0)
+        add(4, _inner_line("Check solartracer-mqtt.service and RS-485 wiring", w), 0)
+        add(6, _inner_line(source_label, w), 0)
+        add(7, _inner_line(f"Retrying every {interval:.0f}s — press q to quit", w, center=True), 0)
+        add(height - 2, _box_bottom(w, "press q to quit"), 0)
+        return lines
+
+    if data_source == "artifacts":
+        add(1, _inner_line(" Stale snapshot from local history files ", w, center=True), 0)
 
     pv_w = _pv_power_w(data)
     bat_w = _battery_power_w(data)
@@ -389,7 +656,7 @@ def build_layout(
     chg_pct = _pct_of(abs(bat_a), rated_chg_a)
     load_pct = _pct_of(load_a, rated_chg_a)
     gen_pct = _pct_of(gen_kwh, max(gen_kwh, 5.0))
-    lights_pct = _lights_gauge_pct(data)
+    lights_pct = load_pct
 
     gauge_w = max(12, min(24, (w - 44) // 2))
     graph_w = max(14, w - gauge_w - 36)
@@ -450,10 +717,10 @@ def build_layout(
         ),
         (
             "Lights",
-            _lights_label(data),
+            _lights_row_value(data),
             lights_pct,
             render_timeline(histories.load_current, graph_w, 0.0, rated_chg_a),
-            "relay output",
+            f"{load_a:.2f} A relay",
         ),
     ]
 
@@ -488,60 +755,111 @@ def build_layout(
 
     add(row, _hline(w), 0)
     row += 1
-    for cfg_line in _config_lines(data, w, device):
+    for cfg_line in _config_lines(data, w, source_label):
         if row >= height - 3:
             break
         add(row, cfg_line, 0)
         row += 1
     row += 1
 
-    footer = f"refresh {interval:.0f}s │ space F/C │ enter lights │ q quit"
+    footer = f"refresh {interval:.0f}s │ space F/C │ enter lights (MQTT) │ q quit"
     add(height - 2, _box_bottom(w, footer), 0)
 
     return lines
 
 
-def render_plain_snapshot(data: Dict[str, Any], device: str) -> str:
+def render_plain_snapshot(
+    data: Dict[str, Any],
+    data_source: str = "mqtt",
+) -> str:
     """Non-TUI fallback for --once."""
     histories = Histories()
+    histories.reload_artifacts()
     histories.update(data)
     lines = build_layout(
-        data, device, histories, width=80, height=28,
+        data, histories, width=80, height=28,
         interval=DEFAULT_INTERVAL, use_fahrenheit=False,
+        data_source=data_source,
     )
     return "\n".join(text for _, text, _ in sorted(lines, key=lambda t: t[0]))
 
 
 class DashboardApp:
-    def __init__(self, device: str, interval: float) -> None:
-        self.device = device
+    def __init__(self, interval: float) -> None:
         self.interval = max(1.0, interval)
         self.histories = Histories()
-        self.cached_config: Dict[str, Any] = {}
-        self.last_config_read = 0.0
         self.use_fahrenheit = False
+        self.data_source = "mqtt"
 
-    def _config_has_values(self, config: Dict[str, Any]) -> bool:
-        return any(v is not None for k, v in config.items() if not k.endswith("_name"))
+    def toggle_lights(
+        self,
+        data: Dict[str, Any],
+        mqtt_cache: Optional[MqttStateCache] = None,
+    ) -> None:
+        next_state = cycle_lights_via_mqtt(data)
+        if mqtt_cache is not None:
+            mqtt_cache.patch(_lights_mode_patch(next_state))
+        time.sleep(1.5)
 
-    def toggle_lights(self, data: Dict[str, Any]) -> None:
-        cycle_lights_state(device=self.device, data=data, quiet=True)
-        time.sleep(0.7)
-
-    def fetch_data(self) -> Dict[str, Any]:
-        now = time.time()
-        need_config = (
-            not self.cached_config
-            or (now - self.last_config_read) >= CONFIG_REFRESH_SEC
-        )
-        data = get_solar_data(device=self.device, include_config=need_config)
-        if need_config and data.get("config") and self._config_has_values(data["config"]):
-            self.cached_config = data["config"]
-            self.last_config_read = now
-        if self.cached_config:
-            data["config"] = self.cached_config
-        data["battery_level_pct"] = compute_battery_level_pct(data, data.get("config"))
+    def fetch_data(self, mqtt_cache: Optional[MqttStateCache] = None) -> Dict[str, Any]:
+        self.histories.reload_artifacts()
+        data, self.data_source = fetch_charger_data(mqtt_cache)
         return data
+
+    def _draw_frame(
+        self,
+        stdscr: "curses._CursesWindow",
+        screen: "PartialScreen",
+        theme: "Theme",
+        data: Dict[str, Any],
+        h: int,
+        w: int,
+        *,
+        loading: bool = False,
+    ) -> None:
+        frame = build_layout(
+            data, self.histories, w, h, self.interval,
+            use_fahrenheit=self.use_fahrenheit,
+            data_source=self.data_source,
+            loading=loading,
+        )
+        for y, text, _attr in frame:
+            attr = 0
+            if "Dashboard" in text:
+                attr = theme.header
+            elif loading:
+                attr = theme.dim
+            elif "unreachable" in text.lower():
+                attr = theme.bad
+            elif "Stale snapshot" in text:
+                attr = theme.warn
+            elif "█" in text and "%" in text:
+                attr = theme.good if "Battery" in text or "PV" in text else theme.accent
+            elif any(c in text for c in SPARK):
+                attr = theme.graph
+            elif "Charging Externally" in text:
+                attr = theme.warn
+            elif "Discharging" in text and "│ Status" in text:
+                attr = theme.accent
+            elif "Voltage Falling" in text or "Voltage Rising" in text:
+                attr = theme.warn
+            elif text.startswith("│ Status"):
+                status = compute_display_status(data, self.histories.battery_voltage_timed)
+                if tracer_is_charging(data):
+                    attr = theme.good
+                elif status in ("TBD", "Idle"):
+                    attr = theme.dim
+                else:
+                    attr = theme.warn
+            screen.put_line(y, 0, text, attr)
+
+        drawn_rows = {y for y, _, _ in frame}
+        for y in range(h):
+            if y not in drawn_rows:
+                screen.put_line(y, 0, "")
+
+        stdscr.noutrefresh()
+        curses.doupdate()
 
     def run(self, stdscr: "curses._CursesWindow") -> None:
         curses.curs_set(0)
@@ -549,94 +867,71 @@ class DashboardApp:
         stdscr.timeout(int(self.interval * 1000))
         theme = Theme(stdscr)
         screen = PartialScreen(stdscr)
+        mqtt_cache = MqttStateCache()
 
-        while True:
+        try:
             h, w = stdscr.getmaxyx()
-            if h < 12 or w < 50:
-                stdscr.clear()
-                stdscr.addstr(0, 0, "Terminal too small (need at least 50×12).")
-                stdscr.refresh()
-                if stdscr.getch() in (ord("q"), ord("Q"), 27):
-                    break
-                continue
-
-            if screen.height != h or screen.width != w:
+            if mqtt_cache.start() and h >= 12 and w >= 50:
                 screen.resize(h, w)
-                stdscr.clear()
-                screen.prev = [[(" ", 0)] * w for _ in range(h)]
+                self._draw_frame(stdscr, screen, theme, {}, h, w, loading=True)
 
-            data = self.fetch_data()
-            self.histories.update(data)
-            frame = build_layout(
-                data, self.device, self.histories, w, h, self.interval,
-                use_fahrenheit=self.use_fahrenheit,
-            )
+            while True:
+                h, w = stdscr.getmaxyx()
+                if h < 12 or w < 50:
+                    stdscr.clear()
+                    stdscr.addstr(0, 0, "Terminal too small (need at least 50×12).")
+                    stdscr.refresh()
+                    if stdscr.getch() in (ord("q"), ord("Q"), 27):
+                        break
+                    continue
 
-            for y, text, _attr in frame:
-                attr = 0
-                if "Dashboard" in text:
-                    attr = theme.header
-                elif "unreachable" in text.lower():
-                    attr = theme.bad
-                elif "█" in text and "%" in text:
-                    attr = theme.good if "Battery" in text or "PV" in text else theme.accent
-                elif any(c in text for c in SPARK):
-                    attr = theme.graph
-                elif "Charging Externally" in text:
-                    attr = theme.warn
-                elif "Discharging" in text and "│ Status" in text:
-                    attr = theme.accent
-                elif "Voltage Falling" in text or "Voltage Rising" in text:
-                    attr = theme.warn
-                elif text.startswith("│ Status"):
-                    status = compute_display_status(data, self.histories.battery_voltage_timed)
-                    if tracer_is_charging(data):
-                        attr = theme.good
-                    elif status in ("TBD", "Idle"):
-                        attr = theme.dim
-                    else:
-                        attr = theme.warn
-                screen.put_line(y, 0, text, attr)
+                if screen.height != h or screen.width != w:
+                    screen.resize(h, w)
+                    stdscr.clear()
+                    screen.prev = [[(" ", 0)] * w for _ in range(h)]
 
-            drawn_rows = {y for y, _, _ in frame}
-            for y in range(h):
-                if y not in drawn_rows:
-                    screen.put_line(y, 0, "")
+                data = self.fetch_data(mqtt_cache)
+                self.histories.update(data)
+                self._draw_frame(stdscr, screen, theme, data, h, w)
 
-            stdscr.noutrefresh()
-            curses.doupdate()
-
-            ch = stdscr.getch()
-            if ch in (ord("q"), ord("Q"), 27):
-                break
-            if ch == ord(" "):
-                self.use_fahrenheit = not self.use_fahrenheit
-                continue
-            if ch in (10, 13, curses.KEY_ENTER):
-                try:
-                    self.toggle_lights(data)
-                except Exception:
-                    pass
-                continue
+                ch = stdscr.getch()
+                if ch in (ord("q"), ord("Q"), 27):
+                    break
+                if ch == ord(" "):
+                    self.use_fahrenheit = not self.use_fahrenheit
+                    continue
+                if ch in (10, 13, curses.KEY_ENTER):
+                    try:
+                        self.toggle_lights(data, mqtt_cache)
+                    except Exception:
+                        pass
+                    continue
+        finally:
+            mqtt_cache.stop()
 
 
-def run_tui(device: str, interval: float) -> int:
+def run_tui(interval: float) -> int:
     try:
-        curses.wrapper(lambda stdscr: DashboardApp(device, interval).run(stdscr))
+        curses.wrapper(lambda stdscr: DashboardApp(interval).run(stdscr))
     except KeyboardInterrupt:
         pass
     return 0
 
 
-def run_once(device: str) -> int:
-    data = get_solar_data(device=device, include_config=True)
-    print(render_plain_snapshot(data, device))
+def run_once() -> int:
+    cfg = _mqtt_settings()
+    print(f"Reading from MQTT ({cfg['base_topic']}/#)…", flush=True)
+    data, source = fetch_charger_data()
+    if source == "artifacts":
+        print("(fallback: local history files — MQTT unavailable)", flush=True)
+    print(render_plain_snapshot(data, data_source=source))
     return 0 if is_charger_reachable(data) else 1
 
 
 def main(argv: Optional[Tuple[str, ...]] = None) -> int:
+    _load_env()
     parser = argparse.ArgumentParser(
-        description="Full-screen dashboard for the EPEVER/Tracer BN solar charger.",
+        description="MQTT-backed dashboard for the EPEVER/Tracer BN solar charger.",
     )
     parser.add_argument(
         "--once",
@@ -650,18 +945,11 @@ def main(argv: Optional[Tuple[str, ...]] = None) -> int:
         metavar="SEC",
         help="Refresh interval in seconds (default: 5)",
     )
-    parser.add_argument(
-        "-d", "--device",
-        default=None,
-        help="Serial device (default: SERIAL_DEVICE from .env or /dev/ttyACM0)",
-    )
     args = parser.parse_args(argv)
 
-    device = args.device or load_serial_device()
-
     if args.once or not sys.stdout.isatty():
-        return run_once(device)
-    return run_tui(device, args.interval)
+        return run_once()
+    return run_tui(args.interval)
 
 
 if __name__ == "__main__":

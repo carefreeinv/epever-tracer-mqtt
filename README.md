@@ -4,6 +4,8 @@ Read an EPEVER / Tracer BN MPPT charge controller over RS-485 and publish state 
 
 Designed for Raspberry Pi + Exar XR21B1411 USB RS-485 adapter + Mosquitto. Also works on other Linux hosts with a Modbus RTU adapter.
 
+**Documentation:** [carefreeinv.github.io/epever-tracer-mqtt](https://carefreeinv.github.io/epever-tracer-mqtt/)
+
 ## Features
 
 - **MQTT + Home Assistant** — auto-discovery sensors, lights control, reachability-aware availability
@@ -100,6 +102,15 @@ Many Tracer units expose **two RJ45 jacks wired in parallel** on the same RS-485
 ## Upstream / reference
 
 See [UPSTREAM.md](UPSTREAM.md). Modbus protocol reference PDFs live in `vendor/epsolar-tracer/archive/`.
+
+## Documentation site
+
+Full docs are published via MkDocs on GitHub Pages. To build locally:
+
+```bash
+pip install -r requirements-docs.txt
+mkdocs serve
+```
 
 ## Changelog
 

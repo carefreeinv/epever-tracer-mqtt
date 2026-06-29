@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- MkDocs documentation site (Material theme) under `docs/`
+- GitHub Actions workflow to deploy docs to GitHub Pages on push to `main`
+
 ## [0.4.0] - 2026-06-29
 
 ### Added

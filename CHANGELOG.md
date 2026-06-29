@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-29
+
+### Added
+- `debug_log.py` — optional `SOLARTRACER_DEBUG` logging with line-buffered journal output
+- `serial_device.recover_serial_comms()` — active USB/RS-485 recovery (rescan, USB reset, Exar reconfigure)
+- `serial_device.reset_exar_usb_device()` — sysfs USB re-authorize with `sudo` fallback
+- `serial_device.wait_for_serial_device()` — poll until the tty node reappears after reset
+- `solar_data.probe_charger()` — quick Modbus reachability check
+- `solar_data.reachability_summary()` — per-register present/missing detail for failure logs
+- `configure-exar-rs485.py --gentle` — poke RS-485 registers without unloading `cdc_acm`
+- Modbus read retries with recovery callback in `get_solar_data()` and `read_battery_voltage()`
+- Configurable env vars: `SERIAL_RECOVERY_POLL_INTERVAL`, `SERIAL_RECOVERY_MAX_ATTEMPTS`, `SERIAL_RECOVERY_COOLDOWN_SEC`
+- systemd service loads `.env` via `EnvironmentFile`
+
+### Changed
+- Publisher polls faster (default 10s) while recovering instead of slowing to 120s
+- Full USB/Exar recovery deferred until 3 consecutive failures; earlier failures only rescan the tty path
+- Unreachable warnings include register-level reachability summary and recovery poll interval
+- Log comms-restored events when the charger comes back after a dropout
+- Exar reconfigure during recovery runs only when the tty vanished or the USB path changed
+
+### Fixed
+- Recovery no longer runs `configure-exar-rs485.py` (rmmod `cdc_acm`) against a healthy open port — this was breaking the USB driver and causing `[Errno 5] Input/output error`
+- USB sysfs reset falls back to `sudo tee` when the service user lacks direct write permission
+- Voltage sampling and full publishes share the same retry/recovery path during outages
+
 ## [0.3.0] - 2026-06-27
 
 ### Added

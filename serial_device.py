@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import glob
 import os
-from typing import List, Optional
+import subprocess
+import sys
+import time
+from typing import Callable, List, Optional, Tuple
 
 EXAR_VENDOR_ID = 0x04E2
 EXAR_PRODUCT_ID = 0x1411
@@ -135,3 +138,200 @@ def rescan_serial_device(
     else:
         message = f"Serial device reappeared: {resolved}"
     return resolved, True, message
+
+
+def _exar_usb_sysfs_path() -> Optional[str]:
+    """Return sysfs path for the Exar USB device (not the tty node)."""
+    for tty_path in sorted(glob.glob("/sys/class/tty/ttyACM*")):
+        device_path = os.path.realpath(os.path.join(tty_path, "device"))
+        path = device_path
+        for _ in range(10):
+            vendor = _read_hex(os.path.join(path, "idVendor"))
+            product = _read_hex(os.path.join(path, "idProduct"))
+            if vendor is not None and product is not None:
+                if vendor == EXAR_VENDOR_ID and product == EXAR_PRODUCT_ID:
+                    return path
+                break
+            parent = os.path.dirname(path)
+            if parent == path:
+                break
+            path = parent
+    return None
+
+
+def wait_for_serial_device(
+    device: str,
+    timeout: float = 8.0,
+    poll_interval: float = 0.25,
+) -> bool:
+    """Block until *device* exists or *timeout* elapses."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(device):
+            return True
+        time.sleep(poll_interval)
+    return os.path.exists(device)
+
+
+def _write_sysfs_authorized(path: str) -> None:
+    with open(path, "w", encoding="ascii") as handle:
+        handle.write("0\n")
+    time.sleep(0.6)
+    with open(path, "w", encoding="ascii") as handle:
+        handle.write("1\n")
+
+
+def _sudo_write_sysfs_authorized(path: str) -> None:
+    for value in ("0", "1"):
+        result = subprocess.run(
+            ["sudo", "-n", "tee", path],
+            input=f"{value}\n",
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise OSError(detail or f"sudo tee {path} failed")
+        if value == "0":
+            time.sleep(0.6)
+
+
+def reset_exar_usb_device() -> Tuple[bool, str]:
+    """Cycle USB authorization to force the adapter to re-enumerate."""
+    sysfs = _exar_usb_sysfs_path()
+    if sysfs is None:
+        return False, "Exar USB device not found in sysfs"
+
+    authorized = os.path.join(sysfs, "authorized")
+    if os.path.exists(authorized):
+        for writer in (_write_sysfs_authorized, _sudo_write_sysfs_authorized):
+            try:
+                writer(authorized)
+                return True, f"USB re-authorized: {sysfs}"
+            except OSError as exc:
+                last_error = exc
+        return False, f"USB re-authorize failed ({last_error})"
+
+    driver_path = os.path.join(sysfs, "driver")
+    device_name = os.path.basename(sysfs)
+    unbind_path = os.path.join(driver_path, "unbind")
+    bind_path = os.path.join(os.path.dirname(driver_path), "bind")
+    if not (os.path.exists(unbind_path) and os.path.exists(bind_path)):
+        return False, "USB reset not available (no authorized or driver unbind)"
+
+    try:
+        with open(unbind_path, "w", encoding="ascii") as handle:
+            handle.write(f"{device_name}\n")
+        time.sleep(0.8)
+        with open(bind_path, "w", encoding="ascii") as handle:
+            handle.write(f"{device_name}\n")
+        return True, f"USB driver rebound: {device_name}"
+    except OSError as exc:
+        return False, f"USB driver rebind failed ({exc})"
+
+
+def reconfigure_exar_adapter(
+    timeout: float = 30.0,
+    *,
+    gentle: bool = False,
+) -> Tuple[bool, str]:
+    """Run configure-exar-rs485.py to restore RS-485 half-duplex mode."""
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configure-exar-rs485.py")
+    if not os.path.isfile(script):
+        return False, f"configure script missing: {script}"
+
+    extra = ["--gentle"] if gentle else []
+    commands = (
+        [sys.executable, script, *extra],
+        ["sudo", "-n", sys.executable, script, *extra],
+    )
+    last_error = "unknown error"
+    for cmd in commands:
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            last_error = str(exc)
+            continue
+        if result.returncode == 0:
+            return True, "Exar RS-485 mode reconfigured"
+        detail = (result.stderr or result.stdout or "").strip()
+        last_error = detail or f"exit {result.returncode}"
+
+    return False, f"Exar reconfigure failed: {last_error}"
+
+
+def recover_serial_comms(
+    current: str,
+    explicit: Optional[str] = None,
+    current_realpath: Optional[str] = None,
+    *,
+    log: Optional[Callable[[str], None]] = None,
+    allow_usb_reset: bool = True,
+    allow_reconfigure: bool = True,
+    wait_timeout: float = 8.0,
+) -> Tuple[str, bool, str]:
+    """Actively try to restore RS-485 comms after a failed read.
+
+    Steps (each logged when *log* is provided):
+      1. Rescan for a new/replugged tty path
+      2. USB reset when the device is missing or the path did not change
+      3. Wait for the serial node to reappear
+      4. Re-run Exar RS-485 configuration
+      5. Final rescan
+
+    Returns (device, did_recovery_work, summary_message).
+    """
+    emit = log or (lambda _msg: None)
+    actions: List[str] = []
+    device = current
+
+    resolved, changed, message = rescan_serial_device(
+        current, explicit, current_realpath,
+    )
+    device = resolved
+    if changed:
+        actions.append(message)
+        emit(message)
+
+    device_missing = not os.path.exists(device)
+    if allow_usb_reset and (device_missing or not changed):
+        ok, usb_msg = reset_exar_usb_device()
+        actions.append(usb_msg)
+        emit(f"Serial recovery: {usb_msg}")
+        if ok:
+            wait_for_serial_device(STABLE_DEVICE, timeout=wait_timeout)
+            for port in find_exar_serial_ports():
+                wait_for_serial_device(port, timeout=wait_timeout)
+            resolved, changed2, msg2 = rescan_serial_device(
+                device, explicit, current_realpath,
+            )
+            device = resolved
+            if changed2:
+                actions.append(msg2)
+                emit(msg2)
+
+    # Reconfigure only when the tty vanished or we just reset USB. Running the
+    # full script (rmmod cdc_acm) against a healthy open port breaks the driver.
+    if allow_reconfigure and (device_missing or changed):
+        ok, cfg_msg = reconfigure_exar_adapter(gentle=device_missing)
+        actions.append(cfg_msg)
+        emit(f"Serial recovery: {cfg_msg}")
+        if ok:
+            wait_for_serial_device(device, timeout=wait_timeout)
+            resolved, changed3, msg3 = rescan_serial_device(
+                device, explicit, current_realpath,
+            )
+            device = resolved
+            if changed3:
+                actions.append(msg3)
+                emit(msg3)
+
+    did_work = bool(actions)
+    summary = "; ".join(actions) if actions else "no recovery actions taken"
+    return device, did_work, summary

@@ -8,6 +8,7 @@ Type=simple
 User=@INSTALL_USER@
 Group=@INSTALL_USER@
 WorkingDirectory=@REPO_DIR@
+EnvironmentFile=-@REPO_DIR@/.env
 ExecStart=/usr/bin/python3 @REPO_DIR@/publish_mqtt.py
 Restart=on-failure
 RestartSec=10

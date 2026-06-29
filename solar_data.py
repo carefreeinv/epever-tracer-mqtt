@@ -17,10 +17,11 @@ import time
 import datetime
 import minimalmodbus
 
+from debug_log import log as debug_log
 from storage import atomic_write_json, read_json_file
 from collections import deque
 from contextlib import contextmanager
-from typing import Any, Deque, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Callable, Deque, Dict, Iterator, List, Optional, Tuple, Union
 
 CHARGE_AMP_THRESHOLD = 0.05
 VOLTAGE_TREND_THRESHOLD = 0.03
@@ -643,17 +644,70 @@ def empirical_hours_discharging_to_empty(
     return min(estimates)
 
 
-def read_battery_voltage(device: Optional[str] = None) -> Optional[float]:
+def probe_charger(device: str, lock_timeout: float = 10.0, *, debug: bool = False) -> bool:
+    """Quick Modbus probe — True when the controller answers on RS-485."""
+    instrument: Optional[minimalmodbus.Instrument] = None
+    try:
+        if debug:
+            debug_log(f"probe_charger: opening {device}")
+        with serial_lock(device, timeout=lock_timeout):
+            instrument = setup_instrument(device, timeout=0.8)
+            value = read_register_safe(
+                instrument, 0x3104, 2, debug=debug, key="battery_voltage",
+            )
+            ok = value is not None
+            if debug:
+                debug_log(f"probe_charger: {device} -> {'ok' if ok else 'no response'}")
+            return ok
+    except (TimeoutError, OSError) as exc:
+        if debug:
+            debug_log(f"probe_charger: {device} failed: {exc}")
+        return False
+    finally:
+        close_instrument(instrument)
+
+
+def read_battery_voltage(
+    device: Optional[str] = None,
+    *,
+    recover: Optional[Callable[[], None]] = None,
+    max_attempts: int = 1,
+    debug: bool = False,
+) -> Optional[float]:
     """Read only battery voltage (0x3104) for lightweight trend sampling."""
     if device is None:
         device = os.getenv("SERIAL_DEVICE", "/dev/ttyACM0")
-    try:
-        with serial_lock(device, timeout=20.0):
-            instrument = setup_instrument(device)
-            return read_register_safe(instrument, 0x3104, 2)
-    except (TimeoutError, OSError) as exc:
-        print(f"Battery voltage read failed for {device}: {exc}")
-        return None
+    attempts = max(1, int(max_attempts))
+    for attempt in range(attempts):
+        instrument: Optional[minimalmodbus.Instrument] = None
+        try:
+            if debug:
+                debug_log(
+                    f"read_battery_voltage: attempt {attempt + 1}/{attempts} on {device}",
+                )
+            with serial_lock(device, timeout=20.0):
+                instrument = setup_instrument(device)
+                value = read_register_safe(
+                    instrument, 0x3104, 2, debug=debug, key="battery_voltage",
+                )
+                if value is not None:
+                    if debug:
+                        debug_log(f"read_battery_voltage: {value}V")
+                    return value
+        except (TimeoutError, OSError) as exc:
+            msg = f"Battery voltage read failed for {device}: {exc}"
+            if debug:
+                debug_log(msg)
+            else:
+                print(msg)
+        finally:
+            close_instrument(instrument)
+        if attempt < attempts - 1 and recover is not None:
+            if debug:
+                debug_log("read_battery_voltage: running retry recovery")
+            recover()
+            time.sleep(0.4)
+    return None
 
 
 def charge_amps(data: Dict[str, Any]) -> float:
@@ -1250,6 +1304,9 @@ def read_register_safe(
     address: int,
     decimals: int = 2,
     functioncode: int = 4,
+    *,
+    debug: bool = False,
+    key: Optional[str] = None,
 ) -> Optional[Union[int, float]]:
     """Read a register, return None on any error."""
     try:
@@ -1258,8 +1315,18 @@ def read_register_safe(
         if decimals == 0 and val is not None:
             return int(val)
         return val
-    except Exception:
+    except Exception as exc:
+        if debug:
+            label = key or f"0x{address:04X}"
+            debug_log(f"register {label} read failed (fc={functioncode}): {exc}")
         return None
+
+
+def reachability_summary(data: Dict[str, Any]) -> str:
+    """Describe which core registers responded for debug logging."""
+    present = [key for key in REACHABILITY_KEYS if data.get(key) is not None]
+    missing = [key for key in REACHABILITY_KEYS if data.get(key) is None]
+    return f"present={present or 'none'} missing={missing or 'none'}"
 
 
 def _decode_config_labels(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -1369,6 +1436,9 @@ def get_solar_data(
     include_config: bool = False,
     lock_timeout: float = 15.0,
     quiet: bool = False,
+    recover: Optional[Callable[[], None]] = None,
+    max_attempts: int = 1,
+    debug: bool = False,
 ) -> Dict[str, Any]:
     """
     Read all defined registers from the solar charger.
@@ -1385,109 +1455,149 @@ def get_solar_data(
     if device is None:
         device = os.getenv("SERIAL_DEVICE", "/dev/ttyACM0")
 
-    data: Dict[str, Optional[float]] = {}
+    attempts = max(1, int(max_attempts))
+    last_data: Dict[str, Any] = {}
 
-    instrument: Optional[minimalmodbus.Instrument] = None
-    try:
-        with serial_lock(device, timeout=lock_timeout):
-            try:
-                instrument = setup_instrument(device)
-            except Exception as e:
-                print(f"Failed to open serial device {device}: {e}")
-                raise
+    for attempt in range(attempts):
+        started = time.time()
+        data: Dict[str, Optional[float]] = {}
+        instrument: Optional[minimalmodbus.Instrument] = None
+        if debug:
+            debug_log(
+                f"get_solar_data: attempt {attempt + 1}/{attempts} on {device} "
+                f"(config={'yes' if include_config else 'no'})",
+            )
+        try:
+            with serial_lock(device, timeout=lock_timeout):
+                try:
+                    instrument = setup_instrument(device)
+                    if debug:
+                        debug_log(f"serial open ok: {device}")
+                except Exception as e:
+                    if debug:
+                        debug_log(f"serial open failed: {device}: {e}")
+                    elif not quiet:
+                        print(f"Failed to open serial device {device}: {e}")
+                    raise
 
-            def _read_registers(reg_list, status=False):
-                for entry in reg_list:
-                    if status:
-                        address, decimals, key = entry
-                    else:
-                        address, decimals, key, *_ = entry
-                    data[key] = read_register_safe(instrument, address, decimals)
+                def _read_registers(reg_list, status=False):
+                    for entry in reg_list:
+                        if status:
+                            address, decimals, key = entry
+                        else:
+                            address, decimals, key, *_ = entry
+                        data[key] = read_register_safe(
+                            instrument,
+                            address,
+                            decimals,
+                            debug=debug,
+                            key=key,
+                        )
+                        if MODBUS_INTER_READ_DELAY_SEC > 0:
+                            time.sleep(MODBUS_INTER_READ_DELAY_SEC)
+
+                _read_registers(REGISTERS)
+                _read_registers(EXTRA_REGISTERS)
+                _read_registers(STATUS_REGISTERS, status=True)
+
+                charging_info = _decode_charging_status(data.get("charging_equipment_status"))
+                data.update(charging_info)
+
+                nttv: Optional[float] = None
+                dttv: Optional[float] = None
+                try:
+                    load_mode = instrument.read_register(0x903D, 0, functioncode=3)
                     if MODBUS_INTER_READ_DELAY_SEC > 0:
                         time.sleep(MODBUS_INTER_READ_DELAY_SEC)
-
-            # Read main realtime + daily registers
-            _read_registers(REGISTERS)
-
-            # Read extra rated registers
-            _read_registers(EXTRA_REGISTERS)
-
-            # Read status registers (as integers)
-            _read_registers(STATUS_REGISTERS, status=True)
-
-            # Add derived charging state
-            charging_info = _decode_charging_status(data.get("charging_equipment_status"))
-            data.update(charging_info)
-
-            # Load / lights relay and PV day/night thresholds (NTTV/DTTV)
-            nttv: Optional[float] = None
-            dttv: Optional[float] = None
-            try:
-                load_mode = instrument.read_register(0x903D, 0, functioncode=3)
-                if MODBUS_INTER_READ_DELAY_SEC > 0:
-                    time.sleep(MODBUS_INTER_READ_DELAY_SEC)
-                data["load_control_mode"] = load_mode
-                data["lights_manual_mode"] = (load_mode == LOAD_CONTROL_MODE_MANUAL)
-                load_default = instrument.read_register(0x906A, 0, functioncode=3)
-                if MODBUS_INTER_READ_DELAY_SEC > 0:
-                    time.sleep(MODBUS_INTER_READ_DELAY_SEC)
-                if load_mode == LOAD_CONTROL_MODE_MANUAL:
-                    data["lights_on"] = bool(load_default)
-                else:
+                    data["load_control_mode"] = load_mode
+                    data["lights_manual_mode"] = (load_mode == LOAD_CONTROL_MODE_MANUAL)
+                    load_default = instrument.read_register(0x906A, 0, functioncode=3)
+                    if MODBUS_INTER_READ_DELAY_SEC > 0:
+                        time.sleep(MODBUS_INTER_READ_DELAY_SEC)
+                    if load_mode == LOAD_CONTROL_MODE_MANUAL:
+                        data["lights_on"] = bool(load_default)
+                    else:
+                        data["lights_on"] = None
+                    nttv = instrument.read_register(0x901E, 2, functioncode=3)
+                    if MODBUS_INTER_READ_DELAY_SEC > 0:
+                        time.sleep(MODBUS_INTER_READ_DELAY_SEC)
+                    dttv = instrument.read_register(0x9020, 2, functioncode=3)
+                except Exception as exc:
+                    if debug:
+                        debug_log(f"load/lights register block failed: {exc}")
+                    data["load_control_mode"] = None
                     data["lights_on"] = None
-                nttv = instrument.read_register(0x901E, 2, functioncode=3)
-                if MODBUS_INTER_READ_DELAY_SEC > 0:
-                    time.sleep(MODBUS_INTER_READ_DELAY_SEC)
-                dttv = instrument.read_register(0x9020, 2, functioncode=3)
-            except Exception:
-                data["load_control_mode"] = None
-                data["lights_on"] = None
-                data["lights_manual_mode"] = None
+                    data["lights_manual_mode"] = None
 
-            data["night_time_threshold_voltage"] = nttv
-            data["day_time_threshold_voltage"] = dttv
-            data["is_night"] = derive_is_night(data.get("pv_voltage"), nttv, dttv)
+                data["night_time_threshold_voltage"] = nttv
+                data["day_time_threshold_voltage"] = dttv
+                data["is_night"] = derive_is_night(data.get("pv_voltage"), nttv, dttv)
 
-            relay = lights_relay_engaged(data)
-            if relay is not None:
-                data["lights_on"] = relay
+                relay = lights_relay_engaged(data)
+                if relay is not None:
+                    data["lights_on"] = relay
 
+                if include_config:
+                    data["config"] = read_charger_config(instrument)
+
+                data["lights_state"] = get_lights_state(data)
+                data["battery_level_pct"] = compute_battery_level_pct(data)
+                close_instrument(instrument)
+                instrument = None
+        except (TimeoutError, OSError) as e:
+            if debug:
+                debug_log(f"RS-485 access failed for {device}: {e}")
+            elif not quiet:
+                print(f"RS-485 access failed for {device}: {e}")
+            for _, _, key, *_ in REGISTERS + EXTRA_REGISTERS:
+                data[key] = None
+            for _, _, key in STATUS_REGISTERS:
+                data[key] = None
+            charging_info = _decode_charging_status(None)
+            data.update(charging_info)
             if include_config:
-                data["config"] = read_charger_config(instrument)
-
-            data["lights_state"] = get_lights_state(data)
-            data["battery_level_pct"] = compute_battery_level_pct(data)
+                data["config"] = {key: None for _, _, key in CONFIG_REGISTERS}
+            data["battery_level_pct"] = None
+        except Exception as e:
             close_instrument(instrument)
             instrument = None
-    except (TimeoutError, OSError) as e:
-        if not quiet:
-            print(f"RS-485 access failed for {device}: {e}")
-        for _, _, key, *_ in REGISTERS + EXTRA_REGISTERS:
-            data[key] = None
-        for _, _, key in STATUS_REGISTERS:
-            data[key] = None
-        charging_info = _decode_charging_status(None)
-        data.update(charging_info)
-        if include_config:
-            data["config"] = {key: None for _, _, key in CONFIG_REGISTERS}
-        data["battery_level_pct"] = None
-    except Exception as e:
-        close_instrument(instrument)
-        instrument = None
-        print(f"Failed to open serial device {device}: {e}")
-        for _, _, key, *_ in REGISTERS + EXTRA_REGISTERS:
-            data[key] = None
-        for _, _, key in STATUS_REGISTERS:
-            data[key] = None
-        charging_info = _decode_charging_status(None)
-        data.update(charging_info)
-        if include_config:
-            data["config"] = {key: None for _, _, key in CONFIG_REGISTERS}
-        data["battery_level_pct"] = None
-    finally:
-        close_instrument(instrument)
+            if debug:
+                debug_log(f"get_solar_data failed for {device}: {e}")
+            elif not quiet:
+                print(f"Failed to open serial device {device}: {e}")
+            for _, _, key, *_ in REGISTERS + EXTRA_REGISTERS:
+                data[key] = None
+            for _, _, key in STATUS_REGISTERS:
+                data[key] = None
+            charging_info = _decode_charging_status(None)
+            data.update(charging_info)
+            if include_config:
+                data["config"] = {key: None for _, _, key in CONFIG_REGISTERS}
+            data["battery_level_pct"] = None
+        finally:
+            close_instrument(instrument)
 
-    return data
+        elapsed = time.time() - started
+        last_data = data
+        if is_charger_reachable(data):
+            if debug:
+                debug_log(
+                    f"get_solar_data: reachable in {elapsed:.2f}s — "
+                    f"{reachability_summary(data)}",
+                )
+            return data
+        if debug:
+            debug_log(
+                f"get_solar_data: unreachable after {elapsed:.2f}s — "
+                f"{reachability_summary(data)}",
+            )
+        if attempt < attempts - 1 and recover is not None:
+            if debug:
+                debug_log("get_solar_data: running retry recovery")
+            recover()
+            time.sleep(0.5)
+
+    return last_data
 
 
 def get_simple_data(device: Optional[str] = None) -> Dict[str, Optional[float]]:

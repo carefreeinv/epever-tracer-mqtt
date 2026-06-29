@@ -12,6 +12,7 @@ Run as root:
 A udev rule can also call this on device plug so it happens automatically.
 After configuration, /dev/ttyACM0 will work for Modbus with the controller.
 """
+import argparse
 import sys
 import os
 import time
@@ -55,6 +56,14 @@ def rebind_cdc_acm(dev):
                 return
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--gentle",
+        action="store_true",
+        help="Only poke RS-485 registers; do not unload/reload cdc_acm",
+    )
+    args = parser.parse_args()
+
     dev = usb.core.find(idVendor=VID, idProduct=PID)
     if dev is None:
         print("Exar XR21B1411 not found")
@@ -103,13 +112,16 @@ def main():
     set_reg(0xc0c, 0x0b)
     set_reg(0xc00, 0x03)
 
-    # The pokes (especially with detach) usually remove the ttyACM0.
-    # Force cdc_acm to re-attach to the (already configured) device.
-    print("  re-attaching cdc_acm driver so /dev/ttyACM0 reappears...")
-    os.system("rmmod cdc_acm 2>/dev/null || true")
-    time.sleep(0.3)
-    os.system("modprobe cdc_acm 2>/dev/null || true")
-    time.sleep(1.2)
+    if args.gentle:
+        print("  gentle mode: leaving cdc_acm bound")
+    else:
+        # The pokes (especially with detach) usually remove the ttyACM0.
+        # Force cdc_acm to re-attach to the (already configured) device.
+        print("  re-attaching cdc_acm driver so /dev/ttyACM0 reappears...")
+        os.system("rmmod cdc_acm 2>/dev/null || true")
+        time.sleep(0.3)
+        os.system("modprobe cdc_acm 2>/dev/null || true")
+        time.sleep(1.2)
 
     print("RS-485 signaling mode activated (gpio_mode=0x0b).")
     print("Use /dev/solartracer-rs485 (or the ttyACM node) with 115200 8N1 RTU (slave 1).")

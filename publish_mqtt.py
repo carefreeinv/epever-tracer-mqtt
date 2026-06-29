@@ -24,7 +24,7 @@ import json
 import os
 import sys
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 try:
     from dotenv import load_dotenv
@@ -37,6 +37,7 @@ except ImportError as e:
 
 # Local module
 try:
+    from debug_log import configure_stdio, debug_enabled, info, log, warn
     from solar_data import (
         CONFIG_MQTT_KEYS,
         LIGHTS_STATES,
@@ -46,11 +47,17 @@ try:
         get_lights_state,
         get_solar_data,
         is_charger_reachable,
+        reachability_summary,
         read_battery_voltage,
         set_lights_enabled,
         set_lights_state,
     )
-    from serial_device import device_realpath, rescan_serial_device, resolve_serial_device
+    from serial_device import (
+        device_realpath,
+        recover_serial_comms,
+        rescan_serial_device,
+        resolve_serial_device,
+    )
     from telemetry_store import TelemetryStore
 except ImportError:
     print("solar_data.py must be in the same directory.")
@@ -60,11 +67,13 @@ except ImportError:
 def load_config() -> Dict[str, Any]:
     """Load configuration from .env (or environment variables)."""
     load_dotenv()
+    configure_stdio()
 
     serial_hint = os.getenv("SERIAL_DEVICE")
     serial_device = resolve_serial_device(serial_hint)
 
     cfg = {
+        "debug": debug_enabled(),
         "serial_device": serial_device,
         "serial_device_hint": serial_hint,
         "mqtt_host": os.getenv("MQTT_HOST", "localhost"),
@@ -83,7 +92,9 @@ def load_config() -> Dict[str, Any]:
             os.getenv("VOLTAGE_SAMPLE_INTERVAL", os.getenv("PUBLISH_INTERVAL", "60"))
         ),
         "config_refresh_sec": float(os.getenv("CONFIG_REFRESH_SEC", "300")),
-        "unreachable_poll_interval": int(os.getenv("UNREACHABLE_POLL_INTERVAL", "120")),
+        "recovery_poll_interval": int(os.getenv("SERIAL_RECOVERY_POLL_INTERVAL", "10")),
+        "recovery_max_attempts": int(os.getenv("SERIAL_RECOVERY_MAX_ATTEMPTS", "3")),
+        "recovery_cooldown_sec": float(os.getenv("SERIAL_RECOVERY_COOLDOWN_SEC", "15")),
         "discovery_refresh_sec": float(os.getenv("DISCOVERY_REFRESH_SEC", "3600")),
     }
     return cfg
@@ -372,35 +383,91 @@ EXTRA_STATE_KEYS = (
 )
 
 UNREACHABLE_CLEAR_THRESHOLD = 3
-SERIAL_RESCAN_INTERVAL_SEC = 30.0
 
 
-def _maybe_rescan_serial(cfg: Dict[str, Any], runtime: Dict[str, Any]) -> bool:
+def _debug_log(cfg: Dict[str, Any], msg: str) -> None:
+    if cfg.get("debug"):
+        log(msg)
+
+
+def _recovery_logger(cfg: Dict[str, Any]) -> Callable[[str], None]:
+    if cfg.get("debug"):
+        return log
+    return print
+
+
+def _apply_rescan(cfg: Dict[str, Any], runtime: Dict[str, Any]) -> bool:
     """Re-detect the Exar port after USB replug (ttyACM number may change)."""
-    now = time.time()
-    if now - runtime.get("last_serial_scan", 0.0) < SERIAL_RESCAN_INTERVAL_SEC:
-        return False
-    runtime["last_serial_scan"] = now
     device, changed, message = rescan_serial_device(
         cfg["serial_device"],
         cfg.get("serial_device_hint"),
         runtime.get("serial_device_realpath"),
     )
     if changed:
-        print(message)
-        cfg["serial_device"] = device
-        runtime["serial_device_realpath"] = device_realpath(device)
-        runtime["consecutive_failures"] = 0
-        return True
-    return False
+        if cfg.get("debug"):
+            log(message)
+        else:
+            print(message)
+    elif cfg.get("debug"):
+        log(
+            f"rescan: no change (device={device} "
+            f"realpath={runtime.get('serial_device_realpath')})",
+        )
+    cfg["serial_device"] = device
+    runtime["serial_device_realpath"] = device_realpath(device)
+    return changed
+
+
+def _attempt_serial_recovery(cfg: Dict[str, Any], runtime: Dict[str, Any]) -> bool:
+    """Run USB reset / reconfigure / rescan when comms are down."""
+    now = time.time()
+    last_recovery = runtime.get("last_serial_recovery", 0.0)
+    cooldown = cfg["recovery_cooldown_sec"]
+    if now - last_recovery < cooldown:
+        remaining = cooldown - (now - last_recovery)
+        _debug_log(
+            cfg,
+            f"recovery cooldown active ({remaining:.0f}s left) — rescan only",
+        )
+        return _apply_rescan(cfg, runtime)
+    runtime["last_serial_recovery"] = now
+    _debug_log(
+        cfg,
+        f"starting full serial recovery on {cfg['serial_device']} "
+        f"(realpath={runtime.get('serial_device_realpath')})",
+    )
+
+    device, _did_work, summary = recover_serial_comms(
+        cfg["serial_device"],
+        cfg.get("serial_device_hint"),
+        runtime.get("serial_device_realpath"),
+        log=_recovery_logger(cfg),
+    )
+    if device != cfg["serial_device"]:
+        msg = f"Serial device now: {device}"
+        if cfg.get("debug"):
+            log(msg)
+        else:
+            print(msg)
+    _debug_log(cfg, f"recovery finished: {summary}")
+    cfg["serial_device"] = device
+    runtime["serial_device_realpath"] = device_realpath(device)
+    return True
+
+
+def _retry_serial_recover(cfg: Dict[str, Any], runtime: Dict[str, Any]) -> None:
+    """Lightweight recovery between read retries in the same poll cycle."""
+    _debug_log(cfg, "retry recovery: rescan between read attempts")
+    _apply_rescan(cfg, runtime)
+    time.sleep(0.5)
 
 
 def _poll_intervals(cfg: Dict[str, Any], runtime: Dict[str, Any]) -> tuple:
-    """Return (publish_interval, voltage_sample_interval), slower when unreachable."""
+    """Return (publish_interval, voltage_sample_interval); faster when recovering."""
     failures = runtime.get("consecutive_failures", 0)
-    if failures >= UNREACHABLE_CLEAR_THRESHOLD:
-        slow = cfg["unreachable_poll_interval"]
-        return slow, slow
+    if failures > 0:
+        fast = cfg["recovery_poll_interval"]
+        return fast, fast
     return cfg["publish_interval"], cfg["voltage_sample_interval"]
 
 
@@ -502,14 +569,34 @@ def publish_states(
 ) -> float:
     """Read current data and publish all states + discovery (including switches for control)."""
     now = time.time()
-    if runtime.get("consecutive_failures", 0) > 0:
-        _maybe_rescan_serial(cfg, runtime)
+    failures_before = runtime.get("consecutive_failures", 0)
+    if failures_before > 0:
+        if failures_before >= UNREACHABLE_CLEAR_THRESHOLD:
+            _debug_log(
+                cfg,
+                f"publish_states: comms down ({failures_before} consecutive failures), "
+                "attempting full serial recovery before read",
+            )
+            _attempt_serial_recovery(cfg, runtime)
+        else:
+            _debug_log(
+                cfg,
+                f"publish_states: comms down ({failures_before} consecutive failures), "
+                "rescan only (full recovery deferred)",
+            )
+            _apply_rescan(cfg, runtime)
 
     need_config = (
         not cached_config
         or (now - last_config_read) >= cfg["config_refresh_sec"]
     )
-    data = get_solar_data(device=cfg["serial_device"], include_config=need_config)
+    data = get_solar_data(
+        device=cfg["serial_device"],
+        include_config=need_config,
+        recover=lambda: _retry_serial_recover(cfg, runtime),
+        max_attempts=cfg["recovery_max_attempts"],
+        debug=cfg.get("debug", False),
+    )
     if need_config and data.get("config") and config_has_values(data["config"]):
         cached_config.clear()
         cached_config.update(data["config"])
@@ -531,17 +618,27 @@ def publish_states(
     if not is_charger_reachable(data):
         runtime["consecutive_failures"] = runtime.get("consecutive_failures", 0) + 1
         failures = runtime["consecutive_failures"]
-        _maybe_rescan_serial(cfg, runtime)
-        print(
-            f"WARNING: Charger unreachable ({failures}/{UNREACHABLE_CLEAR_THRESHOLD}) "
-            f"on {cfg['serial_device']} — keeping last MQTT states"
+        msg = (
+            f"Charger unreachable ({failures}/{UNREACHABLE_CLEAR_THRESHOLD}) "
+            f"on {cfg['serial_device']} — {reachability_summary(data)} — "
+            f"retrying recovery every {cfg['recovery_poll_interval']}s"
         )
+        if cfg.get("debug"):
+            warn(msg)
+        else:
+            print(f"WARNING: {msg}")
         if failures >= UNREACHABLE_CLEAR_THRESHOLD:
+            _debug_log(cfg, "clearing retained MQTT states after repeated failures")
             publish_charger_reachability(client, cfg, False)
             clear_all_states(client, cfg)
             runtime["was_reachable"] = False
         return last_config_read
 
+    if runtime.get("was_reachable") is False:
+        info(
+            f"Charger comms restored on {cfg['serial_device']} — "
+            f"{reachability_summary(data)}",
+        )
     runtime["consecutive_failures"] = 0
     runtime["was_reachable"] = True
     # Always refresh availability while reachable (broker may retain a stale false).
@@ -605,8 +702,11 @@ def main():
     print(f"MQTT base topic: {cfg['mqtt_base_topic']}")
     print(f"Publish interval: {cfg['publish_interval']}s")
     print(f"Voltage sample interval: {cfg['voltage_sample_interval']}s")
-    print(f"Unreachable poll interval: {cfg['unreachable_poll_interval']}s")
+    print(f"Recovery poll interval: {cfg['recovery_poll_interval']}s")
+    print(f"Recovery max attempts per read: {cfg['recovery_max_attempts']}")
     print(f"HA Discovery prefix: {cfg['mqtt_ha_discovery_prefix'] or '(disabled)'}")
+    if cfg["debug"]:
+        print("Debug logging: ENABLED (SOLARTRACER_DEBUG) — unbuffered journal output")
     if dry_run:
         print("DRY_RUN mode - no MQTT connection")
         # Dry run can still print what would be published
@@ -662,7 +762,16 @@ def main():
 
     def sample_voltage_history() -> None:
         nonlocal last_sample
-        voltage = read_battery_voltage(device=cfg["serial_device"])
+        if runtime.get("consecutive_failures", 0) >= UNREACHABLE_CLEAR_THRESHOLD:
+            _attempt_serial_recovery(cfg, runtime)
+        elif runtime.get("consecutive_failures", 0) > 0:
+            _apply_rescan(cfg, runtime)
+        voltage = read_battery_voltage(
+            device=cfg["serial_device"],
+            recover=lambda: _retry_serial_recover(cfg, runtime),
+            max_attempts=cfg["recovery_max_attempts"],
+            debug=cfg.get("debug", False),
+        )
         if voltage is not None:
             telemetry.add_voltage_sample(voltage)
             try:
@@ -688,6 +797,9 @@ def main():
                 sample_voltage_history()
 
             if now - last_publish >= publish_iv:
+                if cfg.get("debug"):
+                    mode = "recovery" if runtime.get("consecutive_failures", 0) > 0 else "normal"
+                    log(f"poll cycle ({mode}, interval={publish_iv}s)")
                 last_config_read = publish_states(
                     client, cfg, telemetry, cached_config, last_config_read, runtime,
                 )

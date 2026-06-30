@@ -11,6 +11,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MkDocs documentation site (Material theme) under `docs/`
 - GitHub Actions workflow to deploy docs to GitHub Pages on push to `main`
 
+## [0.4.1] - 2026-06-29
+
+### Added
+- `serial_device.exar_enumeration_stuck()` — detect Exar on USB bus with no usable tty (kernel `can't set config #1, error -110`)
+- `serial_device.exar_present_on_usb()` — sysfs scan for the adapter before `ttyACM` appears
+- `serial_device.cycle_exar_hub_port()` — power-cycle the hub port via `uhubctl` when sysfs reset hangs
+- Hub port location cache (`var/exar-usb-location`) so recovery targets the correct port after replug
+- `install.sh` installs `uhubctl` when missing
+- Configurable env var: `SERIAL_RECOVERY_COOLDOWN_MISSING_SEC` (default 3s) for faster retries when the tty is gone or wedged
+
+### Changed
+- Default `SERIAL_RECOVERY_POLL_INTERVAL` 5s (was 10s) while recovering
+- Full recovery triggers immediately when enumeration is wedged, not only after 3 consecutive failures
+- Stuck enumeration skips sysfs `authorized` reset and goes straight to hub port cycle
+- Sysfs authorize uses `sudo tee` with timeout only (direct writes can block indefinitely)
+
+### Fixed
+- Publisher no longer crash-loops when sysfs USB reset times out (`subprocess.TimeoutExpired`)
+- Recovery restores comms when the Exar stick is on USB but `ttyACM` never appears
+
 ## [0.4.0] - 2026-06-29
 
 ### Added

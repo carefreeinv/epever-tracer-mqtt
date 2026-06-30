@@ -13,6 +13,9 @@ EXAR_VENDOR_ID = 0x04E2
 EXAR_PRODUCT_ID = 0x1411
 STABLE_DEVICE = "/dev/solartracer-rs485"
 _AUTO_VALUES = frozenset({"", "auto", "detect", "scan"})
+_LOCATION_CACHE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "var", "exar-usb-location",
+)
 
 
 def _read_hex(path: str) -> Optional[int]:
@@ -140,8 +143,56 @@ def rescan_serial_device(
     return resolved, True, message
 
 
-def _exar_usb_sysfs_path() -> Optional[str]:
-    """Return sysfs path for the Exar USB device (not the tty node)."""
+def _hub_port_from_device_name(name: str) -> Tuple[Optional[str], Optional[int]]:
+    """Map a sysfs USB device name (e.g. 1-1.1) to hub location and port."""
+    if "." not in name:
+        return None, None
+    hub, port_str = name.rsplit(".", 1)
+    if not port_str.isdigit():
+        return None, None
+    return hub, int(port_str)
+
+
+def _remember_exar_location(sysfs_path: str) -> None:
+    hub, port = _hub_port_from_device_name(os.path.basename(sysfs_path))
+    if hub is None or port is None:
+        return
+    try:
+        os.makedirs(os.path.dirname(_LOCATION_CACHE), exist_ok=True)
+        with open(_LOCATION_CACHE, "w", encoding="ascii") as handle:
+            handle.write(f"{hub} {port}\n")
+    except OSError:
+        pass
+
+
+def _cached_hub_port() -> Tuple[Optional[str], Optional[int]]:
+    try:
+        with open(_LOCATION_CACHE, encoding="ascii") as handle:
+            parts = handle.read().strip().split()
+        if len(parts) == 2 and parts[1].isdigit():
+            return parts[0], int(parts[1])
+    except OSError:
+        pass
+    return None, None
+
+
+def _exar_usb_bus_devices() -> List[str]:
+    """Find Exar adapters directly on the USB bus (works before ttyACM appears)."""
+    matches: List[str] = []
+    for entry in sorted(glob.glob("/sys/bus/usb/devices/*")):
+        name = os.path.basename(entry)
+        if ":" in name or name.startswith("usb"):
+            continue
+        vendor = _read_hex(os.path.join(entry, "idVendor"))
+        product = _read_hex(os.path.join(entry, "idProduct"))
+        if vendor == EXAR_VENDOR_ID and product == EXAR_PRODUCT_ID:
+            real = os.path.realpath(entry)
+            if real not in matches:
+                matches.append(real)
+    return matches
+
+
+def _exar_usb_sysfs_path_from_tty() -> Optional[str]:
     for tty_path in sorted(glob.glob("/sys/class/tty/ttyACM*")):
         device_path = os.path.realpath(os.path.join(tty_path, "device"))
         path = device_path
@@ -159,6 +210,77 @@ def _exar_usb_sysfs_path() -> Optional[str]:
     return None
 
 
+def _exar_usb_sysfs_path() -> Optional[str]:
+    """Return sysfs path for the Exar USB device (not the tty node)."""
+    bus_devices = _exar_usb_bus_devices()
+    if bus_devices:
+        _remember_exar_location(bus_devices[0])
+        return bus_devices[0]
+    tty_path = _exar_usb_sysfs_path_from_tty()
+    if tty_path is not None:
+        _remember_exar_location(tty_path)
+    return tty_path
+
+
+def exar_present_on_usb() -> bool:
+    """True when the Exar stick is enumerated on the USB bus."""
+    if _exar_usb_bus_devices():
+        return True
+    try:
+        import usb.core
+    except ImportError:
+        return False
+    return usb.core.find(idVendor=EXAR_VENDOR_ID, idProduct=EXAR_PRODUCT_ID) is not None
+
+
+def exar_enumeration_stuck() -> bool:
+    """True when the Exar is on USB but no usable tty node exists (config -110)."""
+    if not exar_present_on_usb():
+        return False
+    for port in find_exar_serial_ports():
+        if not os.path.exists(port):
+            continue
+        real = device_realpath(port)
+        if real and os.path.exists(real):
+            return False
+    return True
+
+
+def cycle_exar_hub_port(
+    hub: Optional[str] = None,
+    port: Optional[int] = None,
+) -> Tuple[bool, str]:
+    """Power-cycle the hub port the Exar stick last used (enumeration recovery)."""
+    if hub is None or port is None:
+        cached_hub, cached_port = _cached_hub_port()
+        hub = hub or cached_hub or "1-1"
+        port = port if port is not None else (cached_port or 1)
+
+    commands = (
+        ["sudo", "-n", "uhubctl", "-l", hub, "-p", str(port), "-a", "cycle"],
+        ["uhubctl", "-l", hub, "-p", str(port), "-a", "cycle"],
+    )
+    last_error = "uhubctl not available"
+    for cmd in commands:
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=12,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            last_error = str(exc)
+            continue
+        if result.returncode == 0:
+            time.sleep(2.0)
+            return True, f"Hub port cycled: {hub} port {port}"
+        detail = (result.stderr or result.stdout or "").strip()
+        last_error = detail or f"exit {result.returncode}"
+
+    return False, f"Hub port cycle failed ({hub}:{port}: {last_error})"
+
+
 def wait_for_serial_device(
     device: str,
     timeout: float = 8.0,
@@ -173,23 +295,19 @@ def wait_for_serial_device(
     return os.path.exists(device)
 
 
-def _write_sysfs_authorized(path: str) -> None:
-    with open(path, "w", encoding="ascii") as handle:
-        handle.write("0\n")
-    time.sleep(0.6)
-    with open(path, "w", encoding="ascii") as handle:
-        handle.write("1\n")
-
-
-def _sudo_write_sysfs_authorized(path: str) -> None:
+def _sudo_write_sysfs_authorized(path: str, timeout: float = 3.0) -> None:
+    """Write authorized via sudo tee; direct sysfs writes can hang when USB is wedged."""
     for value in ("0", "1"):
-        result = subprocess.run(
-            ["sudo", "-n", "tee", path],
-            input=f"{value}\n",
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
+        try:
+            result = subprocess.run(
+                ["sudo", "-n", "tee", path],
+                input=f"{value}\n",
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise OSError(f"timed out writing {path}") from exc
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or "").strip()
             raise OSError(detail or f"sudo tee {path} failed")
@@ -205,13 +323,11 @@ def reset_exar_usb_device() -> Tuple[bool, str]:
 
     authorized = os.path.join(sysfs, "authorized")
     if os.path.exists(authorized):
-        for writer in (_write_sysfs_authorized, _sudo_write_sysfs_authorized):
-            try:
-                writer(authorized)
-                return True, f"USB re-authorized: {sysfs}"
-            except OSError as exc:
-                last_error = exc
-        return False, f"USB re-authorize failed ({last_error})"
+        try:
+            _sudo_write_sysfs_authorized(authorized)
+            return True, f"USB re-authorized: {sysfs}"
+        except OSError as exc:
+            return False, f"USB re-authorize failed ({exc})"
 
     driver_path = os.path.join(sysfs, "driver")
     device_name = os.path.basename(sysfs)
@@ -300,10 +416,25 @@ def recover_serial_comms(
         emit(message)
 
     device_missing = not os.path.exists(device)
-    if allow_usb_reset and (device_missing or not changed):
-        ok, usb_msg = reset_exar_usb_device()
-        actions.append(usb_msg)
-        emit(f"Serial recovery: {usb_msg}")
+    exar_missing = not exar_present_on_usb()
+    stuck = exar_enumeration_stuck()
+    if allow_usb_reset and (device_missing or exar_missing or stuck or not changed):
+        ok = False
+        # sysfs authorize blocks when enumeration is wedged (dmesg: can't set config -110)
+        if stuck:
+            ok_hub, hub_msg = cycle_exar_hub_port()
+            actions.append(hub_msg)
+            emit(f"Serial recovery: {hub_msg}")
+            ok = ok_hub
+        else:
+            ok, usb_msg = reset_exar_usb_device()
+            actions.append(usb_msg)
+            emit(f"Serial recovery: {usb_msg}")
+            if not ok and (device_missing or exar_missing):
+                ok_hub, hub_msg = cycle_exar_hub_port()
+                actions.append(hub_msg)
+                emit(f"Serial recovery: {hub_msg}")
+                ok = ok_hub
         if ok:
             wait_for_serial_device(STABLE_DEVICE, timeout=wait_timeout)
             for port in find_exar_serial_ports():

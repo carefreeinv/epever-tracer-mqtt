@@ -10,6 +10,12 @@ SERVICE_DST="/etc/systemd/system/solartracer-mqtt.service"
 echo "Repo: ${REPO_DIR}"
 echo "Service user: ${INSTALL_USER}"
 
+if ! command -v uhubctl >/dev/null 2>&1; then
+    echo "Installing uhubctl (USB hub port power cycling for Exar recovery)..."
+    sudo apt-get update -qq
+    sudo apt-get install -y -qq uhubctl
+fi
+
 patch_template() {
     sed \
         -e "s|@REPO_DIR@|${REPO_DIR}|g" \

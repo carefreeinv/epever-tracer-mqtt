@@ -54,6 +54,9 @@ try:
     )
     from serial_device import (
         device_realpath,
+        exar_enumeration_stuck,
+        exar_present_on_usb,
+        find_exar_serial_ports,
         recover_serial_comms,
         rescan_serial_device,
         resolve_serial_device,
@@ -92,9 +95,12 @@ def load_config() -> Dict[str, Any]:
             os.getenv("VOLTAGE_SAMPLE_INTERVAL", os.getenv("PUBLISH_INTERVAL", "60"))
         ),
         "config_refresh_sec": float(os.getenv("CONFIG_REFRESH_SEC", "300")),
-        "recovery_poll_interval": int(os.getenv("SERIAL_RECOVERY_POLL_INTERVAL", "10")),
+        "recovery_poll_interval": int(os.getenv("SERIAL_RECOVERY_POLL_INTERVAL", "5")),
         "recovery_max_attempts": int(os.getenv("SERIAL_RECOVERY_MAX_ATTEMPTS", "3")),
         "recovery_cooldown_sec": float(os.getenv("SERIAL_RECOVERY_COOLDOWN_SEC", "15")),
+        "recovery_cooldown_missing_sec": float(
+            os.getenv("SERIAL_RECOVERY_COOLDOWN_MISSING_SEC", "3"),
+        ),
         "discovery_refresh_sec": float(os.getenv("DISCOVERY_REFRESH_SEC", "3600")),
     }
     return cfg
@@ -385,6 +391,32 @@ EXTRA_STATE_KEYS = (
 UNREACHABLE_CLEAR_THRESHOLD = 3
 
 
+def _serial_device_absent(cfg: Dict[str, Any]) -> bool:
+    """True when neither the configured tty nor any Exar port is present."""
+    device = cfg["serial_device"]
+    if os.path.exists(device):
+        return False
+    return not bool(find_exar_serial_ports()) and not exar_present_on_usb()
+
+
+def _serial_device_distressed(cfg: Dict[str, Any]) -> bool:
+    """True when the tty is gone, the stick dropped off USB, or enumeration is wedged."""
+    return _serial_device_absent(cfg) or exar_enumeration_stuck()
+
+
+def _needs_full_recovery(cfg: Dict[str, Any], runtime: Dict[str, Any]) -> bool:
+    failures = runtime.get("consecutive_failures", 0)
+    if failures >= UNREACHABLE_CLEAR_THRESHOLD:
+        return True
+    return _serial_device_distressed(cfg)
+
+
+def _recovery_cooldown_sec(cfg: Dict[str, Any]) -> float:
+    if _serial_device_distressed(cfg):
+        return cfg["recovery_cooldown_missing_sec"]
+    return cfg["recovery_cooldown_sec"]
+
+
 def _debug_log(cfg: Dict[str, Any], msg: str) -> None:
     if cfg.get("debug"):
         log(msg)
@@ -422,7 +454,7 @@ def _attempt_serial_recovery(cfg: Dict[str, Any], runtime: Dict[str, Any]) -> bo
     """Run USB reset / reconfigure / rescan when comms are down."""
     now = time.time()
     last_recovery = runtime.get("last_serial_recovery", 0.0)
-    cooldown = cfg["recovery_cooldown_sec"]
+    cooldown = _recovery_cooldown_sec(cfg)
     if now - last_recovery < cooldown:
         remaining = cooldown - (now - last_recovery)
         _debug_log(
@@ -457,8 +489,12 @@ def _attempt_serial_recovery(cfg: Dict[str, Any], runtime: Dict[str, Any]) -> bo
 
 def _retry_serial_recover(cfg: Dict[str, Any], runtime: Dict[str, Any]) -> None:
     """Lightweight recovery between read retries in the same poll cycle."""
-    _debug_log(cfg, "retry recovery: rescan between read attempts")
-    _apply_rescan(cfg, runtime)
+    if _serial_device_distressed(cfg):
+        _debug_log(cfg, "retry recovery: device absent, attempting full recovery")
+        _attempt_serial_recovery(cfg, runtime)
+    else:
+        _debug_log(cfg, "retry recovery: rescan between read attempts")
+        _apply_rescan(cfg, runtime)
     time.sleep(0.5)
 
 
@@ -571,7 +607,7 @@ def publish_states(
     now = time.time()
     failures_before = runtime.get("consecutive_failures", 0)
     if failures_before > 0:
-        if failures_before >= UNREACHABLE_CLEAR_THRESHOLD:
+        if _needs_full_recovery(cfg, runtime):
             _debug_log(
                 cfg,
                 f"publish_states: comms down ({failures_before} consecutive failures), "
@@ -762,7 +798,7 @@ def main():
 
     def sample_voltage_history() -> None:
         nonlocal last_sample
-        if runtime.get("consecutive_failures", 0) >= UNREACHABLE_CLEAR_THRESHOLD:
+        if _needs_full_recovery(cfg, runtime):
             _attempt_serial_recovery(cfg, runtime)
         elif runtime.get("consecutive_failures", 0) > 0:
             _apply_rescan(cfg, runtime)
